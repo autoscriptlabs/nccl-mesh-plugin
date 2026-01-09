@@ -278,28 +278,28 @@ ncclResult_t mesh_regMr(void *comm, void *data, size_t size,
 }
 ```
 
-**Note**: Current implementation uses host memory staging. GPU memory is copied to host, sent via RDMA, then copied back to GPU on the receiver. GPUDirect RDMA would eliminate these copies.
+**Unified Memory Note**: On Grace Hopper / DGX Spark systems, GPU and CPU share the same physical memory via NVLink-C2C. This means RDMA registration works directly on GPU-accessible memory without any staging copies - we get GPUDirect-like semantics automatically.
 
 ## Performance Considerations
-
-### Current Bottlenecks
-
-1. **Host Memory Staging**: GPU↔Host copies add latency
-2. **Single QP**: One Queue Pair per connection limits parallelism
-3. **Completion Signaling**: Every operation signals completion
 
 ### Achieved Performance
 
 - **8+ GB/s** effective bandwidth
 - **~64%** of 100 Gbps line rate
+- Zero-copy on unified memory (Grace Hopper)
 - Sufficient for distributed ML workloads
+
+### Current Bottlenecks
+
+1. **Single QP**: One Queue Pair per connection limits parallelism
+2. **Completion Signaling**: Every operation signals completion
+3. **Protocol Overhead**: RC transport has per-message overhead
 
 ### Future Optimizations
 
-1. **GPUDirect RDMA**: Register GPU memory directly
-2. **Multi-QP**: Multiple QPs per connection
-3. **Selective Signaling**: Signal every N operations
-4. **Inline Data**: Small messages in WQE
+1. **Multi-QP**: Multiple QPs per connection for parallelism
+2. **Selective Signaling**: Signal every N operations
+3. **Inline Data**: Small messages embedded in WQE
 
 ## File Structure
 
