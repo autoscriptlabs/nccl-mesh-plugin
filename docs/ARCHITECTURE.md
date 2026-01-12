@@ -278,28 +278,41 @@ ncclResult_t mesh_regMr(void *comm, void *data, size_t size,
 }
 ```
 
-**Note**: Current implementation uses host memory staging. GPU memory is copied to host, sent via RDMA, then copied back to GPU on the receiver. GPUDirect RDMA would eliminate these copies.
+**Note on Memory Architecture**: On Grace Hopper / DGX Spark systems with unified memory, GPU and CPU share the same physical memory pool. Memory registered for RDMA is directly accessible by the GPU with no copy overhead. On discrete GPU systems, host memory staging would apply (GPU→Host→RDMA→Host→GPU).
 
 ## Performance Considerations
 
 ### Current Bottlenecks
 
-1. **Host Memory Staging**: GPU↔Host copies add latency
+1. **Single Channel per Port**: ConnectX-7 ports have 2x PCIe 5.0 x4 lanes; we currently use only one (100Gbps instead of 200Gbps)
 2. **Single QP**: One Queue Pair per connection limits parallelism
 3. **Completion Signaling**: Every operation signals completion
+4. **Full Mesh Required**: No relay routing for non-adjacent nodes
 
 ### Achieved Performance
 
 - **8+ GB/s** effective bandwidth
-- **~64%** of 100 Gbps line rate
+- **~64%** of 100 Gbps line rate (single channel)
 - Sufficient for distributed ML workloads
 
-### Future Optimizations
+### Planned Improvements
 
-1. **GPUDirect RDMA**: Register GPU memory directly
-2. **Multi-QP**: Multiple QPs per connection
-3. **Selective Signaling**: Signal every N operations
-4. **Inline Data**: Small messages in WQE
+#### Ring Topology Support
+Enable 4+ node clusters without requiring full mesh connectivity:
+- Relay routing through intermediate nodes for non-adjacent communication
+- Store-and-forward or cut-through forwarding
+- Automatic topology discovery and path selection
+
+#### Dual-Channel Per Port (200Gbps)
+ConnectX-7 ports expose two independent PCIe 5.0 x4 lanes:
+- Create QP pairs (one per channel) for each connection
+- Stripe data across both channels
+- Doubles effective bandwidth: 100Gbps → 200Gbps per cable
+
+#### Additional Optimizations
+1. **Multi-QP**: Multiple QPs per connection for parallelism
+2. **Selective Signaling**: Signal every N operations to reduce CQ overhead
+3. **Inline Data**: Small messages embedded in WQE
 
 ## File Structure
 

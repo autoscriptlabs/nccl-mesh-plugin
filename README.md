@@ -71,7 +71,8 @@ Successfully ran **distributed LLM inference** (Mistral-7B) across all 3 nodes u
 - Raw InfiniBand Verbs API (libibverbs)
 - Reliable Connected (RC) Queue Pairs
 - RoCE v2 over Ethernet
-- Host memory staging (GPU→Host→RDMA→Host→GPU)
+
+> **Note on Grace Hopper / DGX Spark**: These systems use unified memory where GPU and CPU share the same physical memory pool. There is no GPU↔Host copy overhead—memory registered for RDMA is directly accessible by the GPU.
 
 ## 📦 Installation
 
@@ -211,19 +212,24 @@ for (int i = 0; i < handle->num_addrs; i++) {
 | `NCCL_MESH_GID_INDEX` | `3` | RoCE GID index to use |
 | `NCCL_MESH_DEBUG` | `0` | Enable plugin debug output |
 
-## 🚧 Limitations
+## 🚧 Current Limitations
 
-- **Host memory staging**: GPU memory goes through host (no GPUDirect RDMA yet)
+- **Full mesh required**: Non-adjacent nodes can't communicate yet (no relay routing)
+- **Single channel per port**: Currently uses one PCIe lane per ConnectX-7 port (100Gbps), not both (200Gbps)
 - **Single QP per connection**: No multi-rail aggregation
-- **No relay routing**: Non-adjacent nodes can't communicate (fine for fully-connected mesh)
 - **RoCE v2 only**: No InfiniBand support (Ethernet only)
 
 ## 🗺️ Roadmap
 
-- [ ] GPUDirect RDMA support (bypass host memory)
+### Near-term
+- [ ] **Ring topology support**: Relay routing for non-adjacent nodes (enables 4+ node clusters without full mesh)
+- [ ] **Dual-channel per port**: Utilize both PCIe 5.0 x4 lanes per ConnectX-7 port for 200Gbps per cable
+- [ ] **Robustness improvements**: Better error handling, recovery, and diagnostics
+
+### Future
 - [ ] Multi-QP per connection for higher bandwidth
 - [ ] Adaptive routing for partial meshes
-- [ ] Performance tuning (inline data, signaling)
+- [ ] Performance tuning (inline data, selective signaling)
 
 ## 📚 References
 

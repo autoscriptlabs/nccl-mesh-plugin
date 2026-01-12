@@ -4,13 +4,19 @@ This guide covers setting up a direct-connect RDMA mesh topology with multiple n
 
 ## Overview
 
-Our reference setup uses three NVIDIA DGX Spark workstations connected in a triangle mesh topology. Each pair of nodes has a dedicated 100 Gbps RDMA link on its own subnet.
+Our reference setup uses NVIDIA DGX Spark workstations (Grace Hopper architecture with unified memory) connected via direct RDMA cables. The topology options are:
+
+- **3 nodes**: Triangle mesh (fully connected) - current production setup
+- **4 nodes**: Ring topology (each node connects to 2 neighbors) - planned expansion
+
+Each ConnectX-7 port supports up to **200 Gbps** via dual PCIe 5.0 x4 channels, though current software uses single-channel mode (100 Gbps per link).
 
 ## Hardware Requirements
 
-- 3+ nodes with RDMA-capable NICs (ConnectX-6/7 recommended)
-- Direct-attach cables (QSFP56 for 100GbE)
-- Each node needs N-1 NICs for N nodes in a fully-connected mesh
+- 3-4 nodes with RDMA-capable NICs (ConnectX-7 recommended for dual-channel support)
+- Direct-attach cables (QSFP56/QSFP112 for 100/200GbE)
+- For triangle mesh: Each node needs 2 NICs
+- For ring topology: Each node needs 2 NICs
 
 ## Network Topology
 
@@ -218,14 +224,57 @@ Try different GID indices:
 export NCCL_MESH_GID_INDEX=0  # or 1, 2, 3...
 ```
 
-## Scaling Beyond 3 Nodes
+## Scaling to 4 Nodes: Ring Topology
 
-For N nodes in a fully-connected mesh:
-- Each node needs N-1 NICs
-- Total links: N*(N-1)/2
-- Each link on unique subnet
+Full mesh becomes impractical beyond 3 nodes (N nodes requires N-1 NICs each, N*(N-1)/2 total links). For 4 nodes, we use a **ring topology** instead:
 
-For 4 nodes:
+### Ring Topology (4 Nodes)
+
+```
+        Node A
+       /      \
+   NIC1        NIC2
+     |          |
+192.168.101.x  192.168.100.x
+     |          |
+   NIC1        NIC1
+     |          |
+   Node B      Node D
+     |          |
+   NIC2        NIC2
+     |          |
+192.168.102.x  192.168.103.x
+     |          |
+   NIC1        NIC2
+     \          /
+      \        /
+       Node C
+```
+
+### Ring IP Address Assignment
+
+| Link | Subnet | Node A | Node B | Node C | Node D |
+|------|--------|--------|--------|--------|--------|
+| A↔B | 192.168.101.0/24 | .2 | .3 | - | - |
+| B↔C | 192.168.102.0/24 | - | .2 | .3 | - |
+| C↔D | 192.168.103.0/24 | - | - | .2 | .3 |
+| D↔A | 192.168.100.0/24 | .3 | - | - | .2 |
+
+### Ring Advantages
+
+- **Only 2 NICs per node** (vs 3 for full mesh with 4 nodes)
+- **Only 4 links total** (vs 6 for full mesh)
+- **Simpler cabling**: Each node connects to exactly 2 neighbors
+
+### Ring Trade-offs
+
+- **Non-adjacent communication requires relay**: A↔C and B↔D go through intermediate nodes
+- **Higher latency for non-neighbors**: 2 hops instead of 1
+- **Relay routing required**: Plugin must forward traffic (planned feature)
+
+### Full Mesh (Alternative)
+
+For maximum performance with 4 nodes, full mesh is still possible:
 ```
     A
    /|\
@@ -235,8 +284,7 @@ For 4 nodes:
 ```
 - 6 links, 6 subnets
 - Each node needs 3 NICs
-
-For larger clusters, consider a **partial mesh** or **fat-tree** topology with relay routing (not yet implemented in this plugin).
+- Direct communication between all pairs
 
 ## Reference: DGX Spark Mesh
 
