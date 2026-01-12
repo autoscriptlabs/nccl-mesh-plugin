@@ -211,6 +211,7 @@ for (int i = 0; i < handle->num_addrs; i++) {
 | `NCCL_DEBUG` | `WARN` | Set to `INFO` for detailed logs |
 | `NCCL_MESH_GID_INDEX` | `3` | RoCE GID index to use |
 | `NCCL_MESH_DEBUG` | `0` | Enable plugin debug output |
+| `NCCL_MESH_FAST_FAIL` | `0` | Fast failure detection (reduced retries). Set to `1` if nodes may OOM/crash |
 
 ## 🚧 Current Limitations
 

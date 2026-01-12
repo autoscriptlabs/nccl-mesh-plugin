@@ -154,7 +154,12 @@ struct mesh_send_comm {
     uint32_t remote_qp_num;
     union ibv_gid remote_gid;
     int connected;
-    
+
+    // Peer health tracking
+    int peer_failed;            // Set when peer disconnect detected
+    int last_wc_status;         // Last WC error status (for diagnostics)
+    uint64_t error_count;       // Number of errors seen
+
     // Request tracking
     struct mesh_request *requests[MESH_MAX_QPS];
     int num_requests;
@@ -165,7 +170,12 @@ struct mesh_recv_comm {
     struct ibv_qp *qp;
     struct ibv_cq *cq;
     int connected;
-    
+
+    // Peer health tracking
+    int peer_failed;            // Set when peer disconnect detected
+    int last_wc_status;         // Last WC error status (for diagnostics)
+    uint64_t error_count;       // Number of errors seen
+
     // Request tracking
     struct mesh_request *requests[MESH_MAX_QPS];
     int num_requests;
@@ -190,6 +200,8 @@ struct mesh_request {
     size_t size;
     struct ibv_cq *cq;          // CQ to poll for completion
     struct ibv_wc wc;
+    void *comm;                 // Associated send/recv comm (for error propagation)
+    int is_send;                // 1 if send request, 0 if recv
 };
 
 /*
@@ -199,13 +211,14 @@ struct mesh_plugin_state {
     struct mesh_nic nics[MESH_MAX_NICS];
     int num_nics;
     int initialized;
-    
+
     // Configuration
     int gid_index;              // From NCCL_MESH_GID_INDEX
     int debug;                  // From NCCL_MESH_DEBUG
-    
+    int fast_fail;              // From NCCL_MESH_FAST_FAIL: reduce retries for faster failure detection
+
     // Logging (provided by NCCL)
-    void (*log_fn)(int level, unsigned long flags, const char *file, 
+    void (*log_fn)(int level, unsigned long flags, const char *file,
                    int line, const char *fmt, ...);
 };
 
