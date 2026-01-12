@@ -704,13 +704,18 @@ int mesh_connect_qp(struct ibv_qp *qp, struct mesh_nic *nic, struct mesh_handle 
     }
 
     // Transition to RTS (Ready to Send)
-    // Use longer timeout (18 = ~1 second) to handle network delays
+    // In fast-fail mode: use shorter timeout (14 = ~67ms) and fewer retries (3)
+    // Normal mode: longer timeout (18 = ~1s) and max retries (7) for reliability
+    int qp_timeout = g_mesh_state.fast_fail ? 14 : 18;
+    int qp_retry_cnt = g_mesh_state.fast_fail ? 3 : 7;
+    int qp_rnr_retry = g_mesh_state.fast_fail ? 3 : 7;
+
     for (int attempt = 0; attempt < max_retries; attempt++) {
         memset(&qp_attr, 0, sizeof(qp_attr));
         qp_attr.qp_state = IBV_QPS_RTS;
-        qp_attr.timeout = 18;      // ~1 second (2^18 * 4.096µs)
-        qp_attr.retry_cnt = 7;     // Max retries for lost packets
-        qp_attr.rnr_retry = 7;     // Max RNR NAK retries (7 = infinite)
+        qp_attr.timeout = qp_timeout;
+        qp_attr.retry_cnt = qp_retry_cnt;
+        qp_attr.rnr_retry = qp_rnr_retry;
         qp_attr.sq_psn = 0;
         qp_attr.max_rd_atomic = 1;
 
@@ -748,27 +753,32 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
     if (g_mesh_state.initialized) {
         return ncclSuccess;
     }
-    
+
     g_mesh_state.log_fn = logFunction;
-    
+
     // Read configuration from environment
     const char *gid_str = getenv("NCCL_MESH_GID_INDEX");
     g_mesh_state.gid_index = gid_str ? atoi(gid_str) : 3;
-    
+
     const char *debug_str = getenv("NCCL_MESH_DEBUG");
     g_mesh_state.debug = debug_str ? atoi(debug_str) : 0;
-    
-    MESH_INFO("Initializing Mesh plugin (gid_index=%d, debug=%d)",
-              g_mesh_state.gid_index, g_mesh_state.debug);
-    
+
+    // Fast-fail mode: reduce retries for faster peer failure detection
+    // Useful when nodes may OOM or crash during distributed training
+    const char *fast_fail_str = getenv("NCCL_MESH_FAST_FAIL");
+    g_mesh_state.fast_fail = fast_fail_str ? atoi(fast_fail_str) : 0;
+
+    MESH_INFO("Initializing Mesh plugin (gid_index=%d, debug=%d, fast_fail=%d)",
+              g_mesh_state.gid_index, g_mesh_state.debug, g_mesh_state.fast_fail);
+
     if (mesh_init_nics() != 0) {
         MESH_WARN("Failed to initialize NICs");
         return ncclSystemError;
     }
-    
+
     g_mesh_state.initialized = 1;
     MESH_INFO("Mesh plugin initialized with %d NICs", g_mesh_state.num_nics);
-    
+
     return ncclSuccess;
 }
 
@@ -1235,16 +1245,25 @@ static ncclResult_t mesh_isend(void *sendComm, void *data, int size, int tag,
         MESH_WARN("isend: invalid mhandle");
         return ncclSystemError;
     }
-    
+
+    // Fast-fail if peer already known to be disconnected
+    if (comm->peer_failed) {
+        MESH_WARN("isend: peer already failed (last_status=%d), failing fast",
+                  comm->last_wc_status);
+        return ncclSystemError;
+    }
+
     req = calloc(1, sizeof(*req));
     if (!req) {
         return ncclSystemError;
     }
-    
+
     req->used = 1;
     req->size = size;
     req->cq = comm->cq;  // Store CQ for polling
     req->done = 0;
+    req->comm = comm;    // Track comm for error propagation
+    req->is_send = 1;
     
     // Setup scatter/gather entry
     sge.addr = (uintptr_t)data;
@@ -1326,25 +1345,34 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
         MESH_WARN("irecv: invalid mhandle");
         return ncclSystemError;
     }
-    
+
+    // Fast-fail if peer already known to be disconnected
+    if (comm->peer_failed) {
+        MESH_WARN("irecv: peer already failed (last_status=%d), failing fast",
+                  comm->last_wc_status);
+        return ncclSystemError;
+    }
+
     // // fprintf(stderr, "MESH DEBUG: irecv about to access lkey\n");
     fflush(stderr);
     uint32_t lkey = mrh->mr->lkey;
     // // fprintf(stderr, "MESH DEBUG: irecv lkey=%u\n", lkey);
     fflush(stderr);
-    
+
     req = calloc(1, sizeof(*req));
     if (!req) {
         return ncclSystemError;
     }
-    
+
     // // fprintf(stderr, "MESH DEBUG: irecv req allocated=%p\n", (void*)req);
     fflush(stderr);
-    
+
     req->used = 1;
     req->size = sizes[0];
     req->cq = comm->cq;  // Store CQ for polling
     req->done = 0;
+    req->comm = comm;    // Track comm for error propagation
+    req->is_send = 0;
     
     // Setup scatter/gather entry
     sge.addr = (uintptr_t)data[0];
@@ -1395,29 +1423,75 @@ static ncclResult_t mesh_iflush(void *recvComm, int n, void **data, int *sizes,
     return ncclSuccess;
 }
 
+/*
+ * Check if a WC status indicates peer disconnection/failure
+ * These errors typically mean the remote side is unreachable
+ */
+static int mesh_is_peer_failure(enum ibv_wc_status status) {
+    switch (status) {
+        case IBV_WC_RETRY_EXC_ERR:      // Transport retry counter exceeded
+        case IBV_WC_RNR_RETRY_EXC_ERR:  // RNR retry counter exceeded
+        case IBV_WC_REM_ABORT_ERR:      // Remote abort
+        case IBV_WC_REM_ACCESS_ERR:     // Remote access error
+        case IBV_WC_REM_INV_REQ_ERR:    // Remote invalid request
+        case IBV_WC_REM_OP_ERR:         // Remote operation error
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/*
+ * Mark peer as failed on a comm structure
+ * This enables fast-fail for subsequent operations
+ */
+static void mesh_mark_peer_failed(struct mesh_request *req, enum ibv_wc_status status) {
+    if (!req || !req->comm) return;
+
+    if (req->is_send) {
+        struct mesh_send_comm *comm = (struct mesh_send_comm *)req->comm;
+        if (!comm->peer_failed) {
+            comm->peer_failed = 1;
+            comm->last_wc_status = status;
+            MESH_WARN("Peer failure detected on send comm: status=%d (%s)",
+                      status, ibv_wc_status_str(status));
+        }
+        comm->error_count++;
+    } else {
+        struct mesh_recv_comm *comm = (struct mesh_recv_comm *)req->comm;
+        if (!comm->peer_failed) {
+            comm->peer_failed = 1;
+            comm->last_wc_status = status;
+            MESH_WARN("Peer failure detected on recv comm: status=%d (%s)",
+                      status, ibv_wc_status_str(status));
+        }
+        comm->error_count++;
+    }
+}
+
 static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
     struct mesh_request *req = (struct mesh_request *)request;
     struct ibv_wc wc;
     int ret;
-    
+
     if (!req) {
         *done = 1;
         return ncclSuccess;
     }
-    
+
     if (req->done) {
         *done = 1;
         if (sizes) *sizes = req->size;
         return ncclSuccess;
     }
-    
+
     if (!req->cq) {
         MESH_WARN("mesh_test: request has no CQ");
         req->done = 1;
         *done = 1;
         return ncclSuccess;
     }
-    
+
     // Poll for completions - we might get completions for OTHER requests
     // that share this CQ, so keep polling until we find ours or CQ is empty
     while (1) {
@@ -1426,35 +1500,56 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
             MESH_WARN("mesh_test: ibv_poll_cq failed: %s", strerror(errno));
             return ncclSystemError;
         }
-        
+
         if (ret == 0) {
             // No more completions - our request is not done yet
             *done = 0;
             return ncclSuccess;
         }
-        
-        // Got a completion - check status first
-        if (wc.status != IBV_WC_SUCCESS) {
-            MESH_WARN("mesh_test: WC error: status=%d (%s)", 
-                      wc.status, ibv_wc_status_str(wc.status));
-            return ncclSystemError;
-        }
-        
-        // Mark the request that THIS completion belongs to as done
-        // The wr_id contains the request pointer
+
+        // Got a completion - get the associated request
         struct mesh_request *completed_req = (struct mesh_request *)(uintptr_t)wc.wr_id;
+
+        // Check status
+        if (wc.status != IBV_WC_SUCCESS) {
+            // Log detailed error information
+            MESH_WARN("mesh_test: WC error: status=%d (%s) vendor_err=0x%x opcode=%d",
+                      wc.status, ibv_wc_status_str(wc.status), wc.vendor_err, wc.opcode);
+
+            // Check if this indicates peer failure
+            if (mesh_is_peer_failure(wc.status)) {
+                mesh_mark_peer_failed(completed_req, wc.status);
+            }
+
+            // Mark the request as done (with error)
+            if (completed_req) {
+                completed_req->done = 1;
+                completed_req->wc = wc;
+            }
+
+            // If this is our request, return error immediately
+            if (completed_req == req) {
+                *done = 1;
+                return ncclSystemError;
+            }
+
+            // Continue polling for other completions
+            continue;
+        }
+
+        // Success - mark the request as done
         if (completed_req) {
             completed_req->done = 1;
             completed_req->wc = wc;
         }
-        
+
         // Is it OUR request?
         if (completed_req == req) {
             *done = 1;
             if (sizes) *sizes = req->size;
             return ncclSuccess;
         }
-        
+
         // Not our request - keep polling
     }
 }
