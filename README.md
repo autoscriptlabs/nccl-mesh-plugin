@@ -222,7 +222,7 @@ for (int i = 0; i < handle->num_addrs; i++) {
 ## 🗺️ Roadmap
 
 ### Near-term
-- [ ] **Ring topology support**: Relay routing for non-adjacent nodes (enables 4+ node clusters without full mesh)
+- [ ] **Ring topology support**: Relay routing for non-adjacent nodes (required for 4-node Spark clusters - only 2 NICs per node)
 - [ ] **Dual-channel per port**: Utilize both PCIe 5.0 x4 lanes per ConnectX-7 port for 200Gbps per cable
 - [ ] **Robustness improvements**: Better error handling, recovery, and diagnostics
 

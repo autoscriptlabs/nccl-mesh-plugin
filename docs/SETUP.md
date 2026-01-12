@@ -272,19 +272,7 @@ Full mesh becomes impractical beyond 3 nodes (N nodes requires N-1 NICs each, N*
 - **Higher latency for non-neighbors**: 2 hops instead of 1
 - **Relay routing required**: Plugin must forward traffic (planned feature)
 
-### Full Mesh (Alternative)
-
-For maximum performance with 4 nodes, full mesh is still possible:
-```
-    A
-   /|\
-  B-+-C
-   \|/
-    D
-```
-- 6 links, 6 subnets
-- Each node needs 3 NICs
-- Direct communication between all pairs
+> **Note**: Full mesh with 4 nodes would require 3 NICs per node, which isn't possible on DGX Spark (only 2 ConnectX-7 ports per node). Ring topology is the only option for 4-node Spark clusters.
 
 ## Reference: DGX Spark Mesh
 
