@@ -31,17 +31,22 @@ struct mesh_nic {
     struct ibv_pd *pd;
     int port_num;
     int gid_index;
-    
+
+    // Cached GID (TICKET-5: avoid repeated queries and handle changes gracefully)
+    union ibv_gid cached_gid;   // Cached GID value from initialization
+    int gid_valid;              // 1 if cached_gid is valid, 0 otherwise
+    uint64_t gid_query_time;    // Timestamp of last GID query (for staleness check)
+
     // Network addressing
     uint32_t ip_addr;           // Host byte order
-    uint32_t netmask;           // Host byte order  
+    uint32_t netmask;           // Host byte order
     uint32_t subnet;            // ip_addr & netmask
-    
+
     // Device identification
     char dev_name[64];          // RDMA device name (e.g., "rocep1s0f1")
     char if_name[64];           // Network interface name (e.g., "enp1s0f1np1")
     char pci_path[256];         // PCI bus path
-    
+
     // Capabilities
     int max_qp;
     int max_cq;
@@ -49,7 +54,7 @@ struct mesh_nic {
     int max_sge;
     uint64_t max_mr_size;
     int gdr_supported;          // GPUDirect RDMA support
-    
+
     // Statistics
     uint64_t bytes_sent;
     uint64_t bytes_recv;
@@ -189,6 +194,57 @@ struct mesh_mr_handle {
     struct mesh_nic *nic;
     void *addr;
     size_t size;
+    int is_tcp;                 // 1 if this is a TCP fallback registration
+};
+
+/*
+ * TCP fallback communication structures (TICKET-4)
+ * Used when RDMA/IB setup fails or is disabled
+ */
+struct mesh_tcp_listen_comm {
+    int listen_sock;            // TCP listening socket
+    uint16_t listen_port;       // Port we're listening on
+    uint32_t listen_ip;         // IP we're bound to (INADDR_ANY typically)
+    int ready;
+};
+
+struct mesh_tcp_send_comm {
+    int sock;                   // Connected TCP socket
+    uint32_t remote_ip;         // Remote peer IP
+    uint16_t remote_port;       // Remote peer port
+    int connected;
+
+    // Peer health tracking
+    int peer_failed;
+    int last_errno;
+    uint64_t error_count;
+
+    // Buffer for message framing
+    uint8_t send_hdr[8];        // Size header for message framing
+};
+
+struct mesh_tcp_recv_comm {
+    int sock;                   // Connected TCP socket
+    uint32_t remote_ip;         // Remote peer IP
+    int connected;
+
+    // Peer health tracking
+    int peer_failed;
+    int last_errno;
+    uint64_t error_count;
+
+    // Buffer for message framing
+    uint8_t recv_hdr[8];        // Size header for message framing
+};
+
+struct mesh_tcp_request {
+    int used;
+    int done;
+    size_t size;
+    void *data;                 // Buffer for async completion
+    int is_send;                // 1 if send, 0 if recv
+    void *comm;                 // Associated comm
+    int error;                  // Error code if failed
 };
 
 /*
@@ -218,7 +274,11 @@ struct mesh_plugin_state {
     int fast_fail;              // NCCL_MESH_FAST_FAIL: reduce retries for faster failure detection
     int timeout_ms;             // NCCL_MESH_TIMEOUT_MS: connection timeout in ms (default: 5000)
     int retry_count;            // NCCL_MESH_RETRY_COUNT: retry attempts (default: 3)
-    int disable_rdma;           // NCCL_MESH_DISABLE_RDMA: force TCP fallback (not implemented)
+    int disable_rdma;           // NCCL_MESH_DISABLE_RDMA: force TCP fallback
+
+    // TCP fallback state (TICKET-4)
+    int tcp_fallback_active;    // 1 if using TCP fallback, 0 if RDMA
+    int rdma_init_failed;       // 1 if RDMA init failed (used to trigger fallback)
 
     // Logging (provided by NCCL)
     void (*log_fn)(int level, unsigned long flags, const char *file,
@@ -245,11 +305,28 @@ int mesh_get_nic_index(struct mesh_nic *nic);
 // RDMA operations
 int mesh_create_qp(struct mesh_nic *nic, struct ibv_qp **qp, struct ibv_cq **cq);
 int mesh_connect_qp(struct ibv_qp *qp, struct mesh_nic *nic, struct mesh_handle *remote);
-int mesh_post_send(struct mesh_send_comm *comm, void *data, size_t size, 
+int mesh_post_send(struct mesh_send_comm *comm, void *data, size_t size,
                    struct mesh_mr_handle *mr, struct mesh_request *req);
 int mesh_post_recv(struct mesh_recv_comm *comm, void *data, size_t size,
                    struct mesh_mr_handle *mr, struct mesh_request *req);
 int mesh_poll_cq(struct ibv_cq *cq, struct mesh_request *req);
+
+// GID management (TICKET-5: cache and validate GID)
+int mesh_cache_gid(struct mesh_nic *nic);
+int mesh_validate_gid(struct mesh_nic *nic);
+int mesh_get_gid(struct mesh_nic *nic, union ibv_gid *gid);
+
+// TCP fallback operations (TICKET-4)
+int mesh_tcp_init(void);
+int mesh_tcp_listen(int dev, void *handle, void **listenComm);
+int mesh_tcp_connect(int dev, void *handle, void **sendComm);
+int mesh_tcp_accept(void *listenComm, void **recvComm);
+int mesh_tcp_send(void *sendComm, void *data, size_t size, void **request);
+int mesh_tcp_recv(void *recvComm, void *data, size_t size, void **request);
+int mesh_tcp_test(void *request, int *done, int *sizes);
+int mesh_tcp_close_send(void *sendComm);
+int mesh_tcp_close_recv(void *recvComm);
+int mesh_tcp_close_listen(void *listenComm);
 
 // Utilities
 uint32_t mesh_ip_to_uint(const char *ip_str);
