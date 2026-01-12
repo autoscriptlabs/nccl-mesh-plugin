@@ -600,14 +600,16 @@ int mesh_create_qp(struct mesh_nic *nic, struct ibv_qp **qp_out, struct ibv_cq *
     struct ibv_cq *cq;
     struct ibv_qp *qp;
     struct ibv_qp_init_attr qp_init_attr;
-    
+    int err;
+
     // Create completion queue
     cq = ibv_create_cq(nic->context, 128, NULL, NULL, 0);
     if (!cq) {
-        MESH_WARN("Failed to create CQ on %s", nic->dev_name);
+        err = errno;
+        MESH_WARN("Failed to create CQ on %s: errno=%d (%s)", nic->dev_name, err, strerror(err));
         return -1;
     }
-    
+
     // Create queue pair
     memset(&qp_init_attr, 0, sizeof(qp_init_attr));
     qp_init_attr.send_cq = cq;
@@ -618,14 +620,15 @@ int mesh_create_qp(struct mesh_nic *nic, struct ibv_qp **qp_out, struct ibv_cq *
     qp_init_attr.cap.max_send_sge = 1;
     qp_init_attr.cap.max_recv_sge = 1;
     qp_init_attr.cap.max_inline_data = 64;
-    
+
     qp = ibv_create_qp(nic->pd, &qp_init_attr);
     if (!qp) {
-        MESH_WARN("Failed to create QP on %s", nic->dev_name);
+        err = errno;
+        MESH_WARN("Failed to create QP on %s: errno=%d (%s)", nic->dev_name, err, strerror(err));
         ibv_destroy_cq(cq);
         return -1;
     }
-    
+
     // Transition QP to INIT state
     struct ibv_qp_attr qp_attr;
     memset(&qp_attr, 0, sizeof(qp_attr));
@@ -633,65 +636,105 @@ int mesh_create_qp(struct mesh_nic *nic, struct ibv_qp **qp_out, struct ibv_cq *
     qp_attr.pkey_index = 0;
     qp_attr.port_num = nic->port_num;
     qp_attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
-    
+
     if (ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
-        MESH_WARN("Failed to transition QP to INIT on %s", nic->dev_name);
+        err = errno;
+        MESH_WARN("Failed to transition QP to INIT on %s: errno=%d (%s)", nic->dev_name, err, strerror(err));
         ibv_destroy_qp(qp);
         ibv_destroy_cq(cq);
         return -1;
     }
-    
+
     *qp_out = qp;
     *cq_out = cq;
     return 0;
 }
 
 /*
- * Connect QP to remote peer
+ * Connect QP to remote peer with retry logic
+ *
+ * The RTR transition can fail with ETIMEDOUT (110) if the remote QP isn't ready yet.
+ * This happens during rapid collective initialization (FSDP/ZeRO-3) when both sides
+ * are racing to connect. We retry with exponential backoff to handle this.
  */
 int mesh_connect_qp(struct ibv_qp *qp, struct mesh_nic *nic, struct mesh_handle *remote) {
     struct ibv_qp_attr qp_attr;
-    
-    // Transition to RTR
-    memset(&qp_attr, 0, sizeof(qp_attr));
-    qp_attr.qp_state = IBV_QPS_RTR;
-    qp_attr.path_mtu = IBV_MTU_4096;
-    qp_attr.dest_qp_num = remote->qp_num;
-    qp_attr.rq_psn = remote->psn;
-    qp_attr.max_dest_rd_atomic = 1;
-    qp_attr.min_rnr_timer = 12;
-    qp_attr.ah_attr.is_global = 1;
-    qp_attr.ah_attr.grh.dgid = remote->gid;
-    qp_attr.ah_attr.grh.sgid_index = nic->gid_index;
-    qp_attr.ah_attr.grh.hop_limit = 64;
-    qp_attr.ah_attr.dlid = remote->lid;
-    qp_attr.ah_attr.sl = 0;
-    qp_attr.ah_attr.src_path_bits = 0;
-    qp_attr.ah_attr.port_num = nic->port_num;
-    
-    if (ibv_modify_qp(qp, &qp_attr, 
-            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-            IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER)) {
-        MESH_WARN("Failed to transition QP to RTR");
-        return -1;
+    int ret;
+    int max_retries = 5;
+    int retry_delay_ms = 10;  // Start with 10ms, double each retry
+
+    // Transition to RTR (Ready to Receive)
+    // This is where most timeouts occur - remote QP may not be ready yet
+    for (int attempt = 0; attempt < max_retries; attempt++) {
+        memset(&qp_attr, 0, sizeof(qp_attr));
+        qp_attr.qp_state = IBV_QPS_RTR;
+        qp_attr.path_mtu = IBV_MTU_4096;
+        qp_attr.dest_qp_num = remote->qp_num;
+        qp_attr.rq_psn = remote->psn;
+        qp_attr.max_dest_rd_atomic = 1;
+        qp_attr.min_rnr_timer = 12;  // ~0.01ms min RNR NAK timer
+        qp_attr.ah_attr.is_global = 1;
+        qp_attr.ah_attr.grh.dgid = remote->gid;
+        qp_attr.ah_attr.grh.sgid_index = nic->gid_index;
+        qp_attr.ah_attr.grh.hop_limit = 64;
+        qp_attr.ah_attr.dlid = remote->lid;
+        qp_attr.ah_attr.sl = 0;
+        qp_attr.ah_attr.src_path_bits = 0;
+        qp_attr.ah_attr.port_num = nic->port_num;
+
+        ret = ibv_modify_qp(qp, &qp_attr,
+                IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+                IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
+
+        if (ret == 0) {
+            break;  // Success
+        }
+
+        int err = errno;
+        if (attempt < max_retries - 1) {
+            MESH_WARN("QP RTR transition failed (attempt %d/%d): errno=%d (%s), retrying in %dms",
+                      attempt + 1, max_retries, err, strerror(err), retry_delay_ms);
+            usleep(retry_delay_ms * 1000);
+            retry_delay_ms *= 2;  // Exponential backoff
+        } else {
+            MESH_WARN("QP RTR transition failed after %d attempts: errno=%d (%s), dest_qp=%u, gid_index=%d",
+                      max_retries, err, strerror(err), remote->qp_num, nic->gid_index);
+            return -1;
+        }
     }
-    
-    // Transition to RTS
-    memset(&qp_attr, 0, sizeof(qp_attr));
-    qp_attr.qp_state = IBV_QPS_RTS;
-    qp_attr.timeout = 14;
-    qp_attr.retry_cnt = 7;
-    qp_attr.rnr_retry = 7;
-    qp_attr.sq_psn = 0;
-    qp_attr.max_rd_atomic = 1;
-    
-    if (ibv_modify_qp(qp, &qp_attr,
-            IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | 
-            IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC)) {
-        MESH_WARN("Failed to transition QP to RTS");
-        return -1;
+
+    // Transition to RTS (Ready to Send)
+    // Use longer timeout (18 = ~1 second) to handle network delays
+    for (int attempt = 0; attempt < max_retries; attempt++) {
+        memset(&qp_attr, 0, sizeof(qp_attr));
+        qp_attr.qp_state = IBV_QPS_RTS;
+        qp_attr.timeout = 18;      // ~1 second (2^18 * 4.096µs)
+        qp_attr.retry_cnt = 7;     // Max retries for lost packets
+        qp_attr.rnr_retry = 7;     // Max RNR NAK retries (7 = infinite)
+        qp_attr.sq_psn = 0;
+        qp_attr.max_rd_atomic = 1;
+
+        ret = ibv_modify_qp(qp, &qp_attr,
+                IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+                IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
+
+        if (ret == 0) {
+            break;  // Success
+        }
+
+        int err = errno;
+        if (attempt < max_retries - 1) {
+            MESH_WARN("QP RTS transition failed (attempt %d/%d): errno=%d (%s), retrying in %dms",
+                      attempt + 1, max_retries, err, strerror(err), retry_delay_ms);
+            usleep(retry_delay_ms * 1000);
+            retry_delay_ms *= 2;
+        } else {
+            MESH_WARN("QP RTS transition failed after %d attempts: errno=%d (%s)",
+                      max_retries, err, strerror(err));
+            return -1;
+        }
     }
-    
+
     return 0;
 }
 
@@ -980,7 +1023,12 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
             free(comm);
             return ncclSystemError;
         }
-        
+
+        // Small delay to let acceptor's QP transition complete
+        // The acceptor connects its QP before sending the response, but there's a small
+        // window where the QP state may not be fully visible to us yet
+        usleep(1000);  // 1ms
+
         // // fprintf(stderr, "MESH DEBUG: Handshake complete! Remote QP=%u\n", ntohl(remote_qp_info.qp_num));
         fflush(stderr);
     } else {
