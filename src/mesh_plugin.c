@@ -691,7 +691,7 @@ int mesh_create_qp(struct mesh_nic *nic, struct ibv_qp **qp_out, struct ibv_cq *
     int err;
 
     // Create completion queue
-    cq = ibv_create_cq(nic->context, 128, NULL, NULL, 0);
+    cq = ibv_create_cq(nic->context, 4096, NULL, NULL, 0);
     if (!cq) {
         err = errno;
         MESH_WARN("Failed to create CQ on %s: errno=%d (%s)", nic->dev_name, err, strerror(err));
