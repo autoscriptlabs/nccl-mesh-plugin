@@ -33,7 +33,7 @@ Neither works for direct-cabled RDMA meshes. This plugin does.
                       (100Gbps)
 ```
 
-**Three DGX Spark workstations** connected in a triangle mesh with direct 100Gbps RDMA cables. Each link is on a **different subnet** - a configuration NVIDIA never intended to support.
+**Three DGX Spark workstations** connected in a triangle mesh with direct 100Gbps RDMA cables. Each link is on a **different subnet** - a configuration not covered by standard NCCL network plugins.
 
 ## 🚀 Results
 
@@ -247,7 +247,7 @@ MIT License - see [LICENSE](LICENSE) file.
 
 ## 🙏 Acknowledgments
 
-Built to connect three DGX Spark workstations that NVIDIA never intended to be clustered. Sometimes the best solutions come from ignoring "supported configurations."
+Built to connect three DGX Spark workstations in ways that go beyond standard configurations. Sometimes the best solutions come from creative engineering.
 
 ---
 
