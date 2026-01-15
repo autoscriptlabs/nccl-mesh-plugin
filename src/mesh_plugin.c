@@ -2555,6 +2555,11 @@ static ncclResult_t mesh_isend(void *sendComm, void *data, int size, int tag,
         return ncclSystemError;
     }
 
+    // TICKET-9: Track request in comm for cleanup on close
+    // This prevents memory leaks when operations hang and comm is closed
+    if (comm->num_requests < MESH_MAX_QPS) {
+        comm->requests[comm->num_requests++] = req;
+    }
 
     *request = req;
     return ncclSuccess;
@@ -2635,6 +2640,11 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
         return ncclSystemError;
     }
 
+    // TICKET-9: Track request in comm for cleanup on close
+    // This prevents memory leaks when operations hang and comm is closed
+    if (comm->num_requests < MESH_MAX_QPS) {
+        comm->requests[comm->num_requests++] = req;
+    }
 
     *request = req;
     return ncclSuccess;
@@ -2693,6 +2703,32 @@ static void mesh_mark_peer_failed(struct mesh_request *req, enum ibv_wc_status s
     }
 }
 
+/*
+ * TICKET-9: Remove request from comm's tracking array before freeing
+ * This prevents dangling pointers in the comm->requests[] array
+ */
+static void mesh_untrack_request(struct mesh_request *req) {
+    if (!req || !req->comm) return;
+
+    if (req->is_send) {
+        struct mesh_send_comm *comm = (struct mesh_send_comm *)req->comm;
+        for (int i = 0; i < comm->num_requests; i++) {
+            if (comm->requests[i] == req) {
+                comm->requests[i] = NULL;
+                return;
+            }
+        }
+    } else {
+        struct mesh_recv_comm *comm = (struct mesh_recv_comm *)req->comm;
+        for (int i = 0; i < comm->num_requests; i++) {
+            if (comm->requests[i] == req) {
+                comm->requests[i] = NULL;
+                return;
+            }
+        }
+    }
+}
+
 static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
     // Dispatch to TCP if in fallback mode (TICKET-4)
     if (g_mesh_state.tcp_fallback_active) {
@@ -2711,6 +2747,7 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
     if (req->done) {
         *done = 1;
         if (sizes) *sizes = req->size;
+        mesh_untrack_request(req);  // TICKET-9: Remove from comm tracking
         __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
         free(req);  // TICKET-8: Free completed request to prevent memory leak
@@ -2721,6 +2758,7 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
         MESH_WARN("mesh_test: request has no CQ");
         req->done = 1;
         *done = 1;
+        mesh_untrack_request(req);  // TICKET-9: Remove from comm tracking
         __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
         free(req);  // TICKET-8: Free request on completion
         return ncclSuccess;
@@ -2764,6 +2802,7 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
             // If this is our request, return error immediately
             if (completed_req == req) {
                 *done = 1;
+                mesh_untrack_request(req);  // TICKET-9: Remove from comm tracking
                 __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
                 __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
                 free(req);  // TICKET-8: Free request on error completion
@@ -2784,6 +2823,7 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
         if (completed_req == req) {
             *done = 1;
             if (sizes) *sizes = req->size;
+            mesh_untrack_request(req);  // TICKET-9: Remove from comm tracking
             __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
             uint64_t ops = __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED) + 1;
             // TICKET-8: Periodic stats logging every 10000 ops
@@ -2811,6 +2851,19 @@ static ncclResult_t mesh_closeSend(void *sendComm) {
     struct mesh_send_comm *comm = (struct mesh_send_comm *)sendComm;
 
     if (comm) {
+        // TICKET-9: Free any outstanding requests to prevent memory leak
+        // This handles the case where operations hang and comm is closed
+        // before all operations complete (e.g., FSDP timeout during all-gather)
+        for (int i = 0; i < comm->num_requests; i++) {
+            struct mesh_request *req = comm->requests[i];
+            if (req && !req->done) {
+                MESH_DEBUG("closeSend: freeing outstanding request %d", i);
+                __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
+                free(req);
+            }
+        }
+        comm->num_requests = 0;
+
         // TICKET-6: Release pooled connection instead of destroying
         if (comm->pool_entry) {
             mesh_conn_pool_release(comm->pool_entry);
@@ -2835,6 +2888,19 @@ static ncclResult_t mesh_closeRecv(void *recvComm) {
     struct mesh_recv_comm *comm = (struct mesh_recv_comm *)recvComm;
 
     if (comm) {
+        // TICKET-9: Free any outstanding requests to prevent memory leak
+        // This handles the case where operations hang and comm is closed
+        // before all operations complete (e.g., FSDP timeout during all-gather)
+        for (int i = 0; i < comm->num_requests; i++) {
+            struct mesh_request *req = comm->requests[i];
+            if (req && !req->done) {
+                MESH_DEBUG("closeRecv: freeing outstanding request %d", i);
+                __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
+                free(req);
+            }
+        }
+        comm->num_requests = 0;
+
         // QP/CQ are now owned by recv_comm, destroy them
         if (comm->qp) ibv_destroy_qp(comm->qp);
         if (comm->cq) ibv_destroy_cq(comm->cq);
