@@ -1873,10 +1873,11 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
     if (req->done) {
         *done = 1;
         if (sizes) *sizes = req->size;
+        int had_error = req->error;  // Save before free
         __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
         free(req);  // TICKET-8: Free synchronously completed request
-        return req->error ? ncclSystemError : ncclSuccess;
+        return had_error ? ncclSystemError : ncclSuccess;
     }
 
     *done = 0;

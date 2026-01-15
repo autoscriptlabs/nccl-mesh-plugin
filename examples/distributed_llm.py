@@ -17,9 +17,15 @@ Environment setup (run on each node):
 """
 
 import argparse
+import os
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from accelerate import Accelerator
+
+
+def is_local_path(model_path):
+    """Check if the model path is a local filesystem path."""
+    return os.path.exists(model_path) or model_path.startswith('/')
 
 
 def main():
@@ -40,14 +46,25 @@ def main():
     # Initialize accelerator
     accelerator = Accelerator()
     
+    # Determine if model is a local path or HuggingFace repo ID
+    use_local = is_local_path(args.model)
+    if use_local:
+        print(f'Rank {accelerator.process_index}: Using local model path: {args.model}')
+
     print(f'Rank {accelerator.process_index}: Loading tokenizer...')
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model,
+        local_files_only=use_local,
+        trust_remote_code=True,
+    )
+
     print(f'Rank {accelerator.process_index}: Loading model...')
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=torch.bfloat16,
         device_map='auto',
+        local_files_only=use_local,
+        trust_remote_code=True,
     )
     
     print(f'Rank {accelerator.process_index}: Model loaded!')
