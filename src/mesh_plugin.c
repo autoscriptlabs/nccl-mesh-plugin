@@ -1988,6 +1988,14 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
              g_mesh_state.timeout_ms, g_mesh_state.retry_count, g_mesh_state.disable_rdma,
              g_mesh_state.enable_conn_pool, g_mesh_state.enable_async_connect);
 
+    // Verify handle struct size fits in NCCL limits (NCCL_NET_HANDLE_MAXSIZE = 128)
+    MESH_LOG(NCCL_LOG_INFO, "MESH Handle size: %zu bytes (max 128)", sizeof(struct mesh_handle));
+    if (sizeof(struct mesh_handle) > 128) {
+        MESH_WARN("CRITICAL: mesh_handle size %zu > 128 bytes! Handle will be truncated!",
+                  sizeof(struct mesh_handle));
+        return ncclInternalError;
+    }
+
     // Check if TCP fallback is forced (TICKET-4)
     if (g_mesh_state.disable_rdma) {
         MESH_WARN("NCCL_MESH_DISABLE_RDMA=1: Forcing TCP fallback mode");
@@ -2198,7 +2206,15 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
     
     // Validate handle
     if (handle->magic != MESH_HANDLE_MAGIC) {
-        MESH_WARN("Invalid handle magic: 0x%x", handle->magic);
+        MESH_WARN("Invalid handle magic: 0x%x (expected 0x%x)", handle->magic, MESH_HANDLE_MAGIC);
+        MESH_WARN("Handle size: %zu bytes, raw bytes:", sizeof(struct mesh_handle));
+        // Hex dump first 64 bytes for debugging
+        uint8_t *raw = (uint8_t *)handle;
+        for (int i = 0; i < 64 && i < (int)sizeof(struct mesh_handle); i += 16) {
+            MESH_WARN("  %02d: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x",
+                      i, raw[i], raw[i+1], raw[i+2], raw[i+3], raw[i+4], raw[i+5], raw[i+6], raw[i+7],
+                      raw[i+8], raw[i+9], raw[i+10], raw[i+11], raw[i+12], raw[i+13], raw[i+14], raw[i+15]);
+        }
         return ncclInvalidArgument;
     }
     
