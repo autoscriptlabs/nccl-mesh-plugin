@@ -1736,6 +1736,16 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
 static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
     struct mesh_tcp_request *req = (struct mesh_tcp_request *)request;
 
+    // TICKET-10: Debug counter to track test() activity
+    static uint64_t test_call_count = 0;
+    static uint64_t test_send_progress = 0;
+    static uint64_t test_recv_progress = 0;
+    test_call_count++;
+    if ((test_call_count % 100000) == 0) {
+        MESH_INFO("TCP test: calls=%lu send_bytes=%lu recv_bytes=%lu",
+                  test_call_count, test_send_progress, test_recv_progress);
+    }
+
     if (!req) {
         *done = 1;
         return ncclSuccess;
@@ -1868,9 +1878,14 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
             }
         }
 
-        // TICKET-10: Do ONE recv attempt per call for fair scheduling across channels
-        // This prevents one request from monopolizing the proxy thread
-        if (req->offset < req->msg_size) {
+        // TICKET-10: Do BOUNDED recv attempts for good throughput with fair scheduling
+        // Try up to 16 iterations or until EAGAIN, then yield to other requests
+        int recv_iterations = 0;
+        const int max_recv_iterations = 16;
+
+        while (req->offset < req->msg_size && recv_iterations < max_recv_iterations) {
+            recv_iterations++;
+
             do {
                 recvd = recv(comm->sock, (char *)req->data + req->offset,
                             req->msg_size - req->offset, 0);
@@ -1892,10 +1907,8 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                 return ncclSystemError;
             } else if (recvd < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // No data available right now - return for more polling
-                    fcntl(comm->sock, F_SETFL, flags);
-                    *done = 0;
-                    return ncclSuccess;
+                    // No more data available right now - yield to other requests
+                    break;
                 }
                 MESH_WARN("TCP test: Failed to receive data: %s", strerror(errno));
                 req->error = errno;
@@ -1911,6 +1924,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                 return ncclSystemError;
             }
             req->offset += recvd;
+            test_recv_progress += recvd;
         }
 
         // Check if all data received
@@ -1999,8 +2013,14 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
         }
 
         // TICKET-10: Do ONE send attempt per call for fair scheduling across channels
-        // This prevents one request from monopolizing the proxy thread
-        if (req->offset < req->size) {
+        // TICKET-10: Do BOUNDED send attempts for good throughput with fair scheduling
+        // Try up to 16 iterations or until EAGAIN, then yield to other requests
+        int send_iterations = 0;
+        const int max_send_iterations = 16;
+
+        while (req->offset < req->size && send_iterations < max_send_iterations) {
+            send_iterations++;
+
             do {
                 sent = send(comm->sock, (char *)req->data + req->offset,
                            req->size - req->offset, MSG_NOSIGNAL);
@@ -2008,10 +2028,8 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
 
             if (sent <= 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // Socket buffer full - return for more polling
-                    fcntl(comm->sock, F_SETFL, flags);
-                    *done = 0;
-                    return ncclSuccess;
+                    // Socket buffer full - yield to other requests
+                    break;
                 }
                 MESH_WARN("TCP test: Failed to send data: %s", strerror(errno));
                 comm->peer_failed = 1;
@@ -2028,6 +2046,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                 return ncclSystemError;
             }
             req->offset += sent;
+            test_send_progress += sent;
         }
 
         // Check if all data sent
