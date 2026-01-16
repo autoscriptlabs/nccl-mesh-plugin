@@ -1650,6 +1650,7 @@ static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag
     // Try to send size header (4 bytes, network byte order)
     // TICKET-10: Handle EINTR and retry for transient errors
     uint32_t net_size = htonl(size);
+    MESH_DEBUG("TCP isend: sending header size=%d (net_size=0x%08x)", size, net_size);
     ssize_t sent;
     do {
         sent = send(comm->sock, &net_size, sizeof(net_size), MSG_NOSIGNAL);
@@ -1804,6 +1805,11 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
         recvd = recv(comm->sock, &net_size, sizeof(net_size), 0);
     } while (recvd < 0 && errno == EINTR);
 
+    MESH_DEBUG("TCP irecv: received header net_size=0x%08x (raw bytes: %02x %02x %02x %02x)",
+               net_size,
+               ((unsigned char*)&net_size)[0], ((unsigned char*)&net_size)[1],
+               ((unsigned char*)&net_size)[2], ((unsigned char*)&net_size)[3]);
+
     if (recvd != sizeof(net_size)) {
         MESH_WARN("TCP irecv: Failed to consume header: %s", strerror(errno));
         comm->peer_failed = 1;
@@ -1815,6 +1821,7 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
     }
 
     uint32_t msg_size = ntohl(net_size);
+    MESH_DEBUG("TCP irecv: msg_size=%u (after ntohl), buffer_size=%d", msg_size, sizes[0]);
     if (msg_size > (uint32_t)sizes[0]) {
         MESH_WARN("TCP irecv: Message too large (%u > %d)", msg_size, sizes[0]);
         fcntl(comm->sock, F_SETFL, flags);
