@@ -73,7 +73,7 @@ if [ -n "$SLURM_JOB_ID" ]; then
 
     srun --nodes=${NUM_NODES} \
          --ntasks-per-node=1 \
-         --cpus-per-task=64 \
+         --cpus-per-task=12 \
          torchrun \
             --nproc_per_node=1 \
             --nnodes=${NUM_NODES} \
