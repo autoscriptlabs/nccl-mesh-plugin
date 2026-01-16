@@ -1868,8 +1868,9 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
             }
         }
 
-        // Continue receiving data from where we left off
-        while (req->offset < req->msg_size) {
+        // TICKET-10: Do ONE recv attempt per call for fair scheduling across channels
+        // This prevents one request from monopolizing the proxy thread
+        if (req->offset < req->msg_size) {
             do {
                 recvd = recv(comm->sock, (char *)req->data + req->offset,
                             req->msg_size - req->offset, 0);
@@ -1891,7 +1892,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                 return ncclSystemError;
             } else if (recvd < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // No more data available - return for more polling
+                    // No data available right now - return for more polling
                     fcntl(comm->sock, F_SETFL, flags);
                     *done = 0;
                     return ncclSuccess;
@@ -1912,18 +1913,26 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
             req->offset += recvd;
         }
 
-        // All data received
+        // Check if all data received
+        if (req->offset >= req->msg_size) {
+            // All data received
+            fcntl(comm->sock, F_SETFL, flags);
+            req->size = req->msg_size;
+            req->done = 1;
+            *done = 1;
+            if (sizes) *sizes = req->msg_size;
+            // Dequeue from head
+            comm->recv_queue_head = req->next;
+            if (comm->recv_queue_head == NULL) comm->recv_queue_tail = NULL;
+            __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
+            free(req);
+            return ncclSuccess;
+        }
+
+        // More data needed - return for more polling
         fcntl(comm->sock, F_SETFL, flags);
-        req->size = req->msg_size;
-        req->done = 1;
-        *done = 1;
-        if (sizes) *sizes = req->msg_size;
-        // Dequeue from head
-        comm->recv_queue_head = req->next;
-        if (comm->recv_queue_head == NULL) comm->recv_queue_tail = NULL;
-        __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
-        __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
-        free(req);
+        *done = 0;
         return ncclSuccess;
     }
 
@@ -1989,8 +1998,9 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
             req->header_sent = 1;
         }
 
-        // Continue sending data from where we left off
-        while (req->offset < req->size) {
+        // TICKET-10: Do ONE send attempt per call for fair scheduling across channels
+        // This prevents one request from monopolizing the proxy thread
+        if (req->offset < req->size) {
             do {
                 sent = send(comm->sock, (char *)req->data + req->offset,
                            req->size - req->offset, MSG_NOSIGNAL);
@@ -2020,17 +2030,25 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
             req->offset += sent;
         }
 
-        // All data sent
+        // Check if all data sent
+        if (req->offset >= req->size) {
+            // All data sent
+            fcntl(comm->sock, F_SETFL, flags);
+            req->done = 1;
+            *done = 1;
+            if (sizes) *sizes = req->size;
+            // Dequeue from head
+            comm->send_queue_head = req->next;
+            if (comm->send_queue_head == NULL) comm->send_queue_tail = NULL;
+            __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
+            free(req);
+            return ncclSuccess;
+        }
+
+        // More data to send - return for more polling
         fcntl(comm->sock, F_SETFL, flags);
-        req->done = 1;
-        *done = 1;
-        if (sizes) *sizes = req->size;
-        // Dequeue from head
-        comm->send_queue_head = req->next;
-        if (comm->send_queue_head == NULL) comm->send_queue_tail = NULL;
-        __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
-        __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
-        free(req);
+        *done = 0;
         return ncclSuccess;
     }
 
