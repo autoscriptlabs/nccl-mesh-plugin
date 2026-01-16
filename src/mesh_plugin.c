@@ -1627,12 +1627,6 @@ static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag
         return ncclSystemError;
     }
 
-    // TICKET-10: Check for overlapping requests - this would corrupt the byte stream
-    if (comm->pending_req != NULL) {
-        MESH_WARN("TCP isend: Previous request still pending (overlapping isend calls)");
-        return ncclSystemError;
-    }
-
     req = calloc(1, sizeof(*req));
     if (!req) {
         return ncclSystemError;
@@ -1648,9 +1642,27 @@ static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag
     req->error = 0;
     req->offset = 0;
     req->header_sent = 0;
+    req->next = NULL;
 
-    // TICKET-10: Mark this request as pending to prevent overlapping operations
-    comm->pending_req = req;
+    // TICKET-10: Enqueue request in FIFO queue
+    // TCP sends data in-order, so we process requests in FIFO order
+    if (comm->send_queue_tail == NULL) {
+        // Queue is empty - this request is both head and tail
+        comm->send_queue_head = req;
+        comm->send_queue_tail = req;
+    } else {
+        // Append to tail
+        comm->send_queue_tail->next = req;
+        comm->send_queue_tail = req;
+    }
+
+    // Only try to send immediately if this is the head of the queue
+    // (i.e., no other requests are pending ahead of us)
+    if (comm->send_queue_head != req) {
+        // There are other requests ahead - just return, test() will process in order
+        *request = req;
+        return ncclSuccess;
+    }
 
     // Set socket to non-blocking for async send
     int flags = fcntl(comm->sock, F_GETFL, 0);
@@ -1676,7 +1688,9 @@ static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag
         comm->peer_failed = 1;
         comm->last_errno = errno;
         fcntl(comm->sock, F_SETFL, flags);
-        comm->pending_req = NULL;
+        // Dequeue from head
+        comm->send_queue_head = req->next;
+        if (comm->send_queue_head == NULL) comm->send_queue_tail = NULL;
         __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
         free(req);
         return ncclSystemError;
@@ -1686,7 +1700,9 @@ static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag
         MESH_WARN("TCP isend: Partial header send (%zd/%zu)", sent, sizeof(net_size));
         comm->peer_failed = 1;
         fcntl(comm->sock, F_SETFL, flags);
-        comm->pending_req = NULL;
+        // Dequeue from head
+        comm->send_queue_head = req->next;
+        if (comm->send_queue_head == NULL) comm->send_queue_tail = NULL;
         __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
         free(req);
         return ncclSystemError;
@@ -1937,7 +1953,10 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
         ncclResult_t result = req->error ? ncclSystemError : ncclSuccess;
         // TICKET-10: Dequeue from appropriate queue before freeing
         if (req->is_send && req->comm) {
-            ((struct mesh_tcp_send_comm *)req->comm)->pending_req = NULL;
+            struct mesh_tcp_send_comm *scomm = (struct mesh_tcp_send_comm *)req->comm;
+            // Dequeue from head
+            scomm->send_queue_head = req->next;
+            if (scomm->send_queue_head == NULL) scomm->send_queue_tail = NULL;
         } else if (!req->is_send && req->comm) {
             struct mesh_tcp_recv_comm *rcomm = (struct mesh_tcp_recv_comm *)req->comm;
             // Dequeue from head
@@ -2119,6 +2138,14 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
         struct mesh_tcp_send_comm *comm = (struct mesh_tcp_send_comm *)req->comm;
         ssize_t sent;
 
+        // TICKET-10: Only process if this request is at the head of the queue
+        // TCP sends data in-order, so we must complete requests in FIFO order
+        if (comm->send_queue_head != req) {
+            // Not our turn yet - another request must complete first
+            *done = 0;
+            return ncclSuccess;
+        }
+
         // Set socket to non-blocking
         int flags = fcntl(comm->sock, F_GETFL, 0);
         fcntl(comm->sock, F_SETFL, flags | O_NONBLOCK);
@@ -2142,7 +2169,9 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                 req->done = 1;
                 *done = 1;
                 fcntl(comm->sock, F_SETFL, flags);
-                comm->pending_req = NULL;
+                // Dequeue from head
+                comm->send_queue_head = req->next;
+                if (comm->send_queue_head == NULL) comm->send_queue_tail = NULL;
                 __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
                 __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
                 free(req);
@@ -2155,7 +2184,9 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                 req->done = 1;
                 *done = 1;
                 fcntl(comm->sock, F_SETFL, flags);
-                comm->pending_req = NULL;
+                // Dequeue from head
+                comm->send_queue_head = req->next;
+                if (comm->send_queue_head == NULL) comm->send_queue_tail = NULL;
                 __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
                 __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
                 free(req);
@@ -2184,7 +2215,9 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                 req->done = 1;
                 *done = 1;
                 fcntl(comm->sock, F_SETFL, flags);
-                comm->pending_req = NULL;
+                // Dequeue from head
+                comm->send_queue_head = req->next;
+                if (comm->send_queue_head == NULL) comm->send_queue_tail = NULL;
                 __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
                 __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
                 free(req);
@@ -2198,7 +2231,9 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
         req->done = 1;
         *done = 1;
         if (sizes) *sizes = req->size;
-        comm->pending_req = NULL;
+        // Dequeue from head
+        comm->send_queue_head = req->next;
+        if (comm->send_queue_head == NULL) comm->send_queue_tail = NULL;
         __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
         free(req);
@@ -2212,7 +2247,10 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
         int had_error = req->error;  // Save before free
         // TICKET-10: Dequeue from appropriate queue before freeing
         if (req->is_send && req->comm) {
-            ((struct mesh_tcp_send_comm *)req->comm)->pending_req = NULL;
+            struct mesh_tcp_send_comm *scomm = (struct mesh_tcp_send_comm *)req->comm;
+            // Dequeue from head
+            scomm->send_queue_head = req->next;
+            if (scomm->send_queue_head == NULL) scomm->send_queue_tail = NULL;
         } else if (!req->is_send && req->comm) {
             struct mesh_tcp_recv_comm *rcomm = (struct mesh_tcp_recv_comm *)req->comm;
             // Dequeue from head
