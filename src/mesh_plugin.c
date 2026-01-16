@@ -1656,88 +1656,11 @@ static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag
         comm->send_queue_tail = req;
     }
 
-    // Only try to send immediately if this is the head of the queue
-    // (i.e., no other requests are pending ahead of us)
-    if (comm->send_queue_head != req) {
-        // There are other requests ahead - just return, test() will process in order
-        *request = req;
-        return ncclSuccess;
-    }
-
-    // Set socket to non-blocking for async send
-    int flags = fcntl(comm->sock, F_GETFL, 0);
-    fcntl(comm->sock, F_SETFL, flags | O_NONBLOCK);
-
-    // Try to send size header (4 bytes, network byte order)
-    // TICKET-10: Handle EINTR and retry for transient errors
-    uint32_t net_size = htonl(size);
-    MESH_DEBUG("TCP isend: sending header size=%d (net_size=0x%08x)", size, net_size);
-    ssize_t sent;
-    do {
-        sent = send(comm->sock, &net_size, sizeof(net_size), MSG_NOSIGNAL);
-    } while (sent < 0 && errno == EINTR);
-
-    if (sent < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            // Can't even send header yet - return for polling
-            fcntl(comm->sock, F_SETFL, flags);
-            *request = req;
-            return ncclSuccess;
-        }
-        MESH_WARN("TCP isend: Failed to send header: %s", strerror(errno));
-        comm->peer_failed = 1;
-        comm->last_errno = errno;
-        fcntl(comm->sock, F_SETFL, flags);
-        // Dequeue from head
-        comm->send_queue_head = req->next;
-        if (comm->send_queue_head == NULL) comm->send_queue_tail = NULL;
-        __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
-        free(req);
-        return ncclSystemError;
-    }
-    if (sent != sizeof(net_size)) {
-        // Partial header send - treat as error (4 bytes should always fit)
-        MESH_WARN("TCP isend: Partial header send (%zd/%zu)", sent, sizeof(net_size));
-        comm->peer_failed = 1;
-        fcntl(comm->sock, F_SETFL, flags);
-        // Dequeue from head
-        comm->send_queue_head = req->next;
-        if (comm->send_queue_head == NULL) comm->send_queue_tail = NULL;
-        __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
-        free(req);
-        return ncclSystemError;
-    }
-    req->header_sent = 1;
-
-    // Try to send as much data as possible without blocking
-    // TICKET-10: Handle EINTR properly
-    while (req->offset < (size_t)size) {
-        do {
-            sent = send(comm->sock, (char *)data + req->offset, size - req->offset, MSG_NOSIGNAL);
-        } while (sent < 0 && errno == EINTR);
-
-        if (sent <= 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Socket buffer full - return for async completion in test()
-                fcntl(comm->sock, F_SETFL, flags);
-                *request = req;
-                return ncclSuccess;
-            }
-            MESH_WARN("TCP isend: Failed to send data: %s", strerror(errno));
-            comm->peer_failed = 1;
-            comm->last_errno = errno;
-            req->error = errno;
-            req->done = 1;
-            fcntl(comm->sock, F_SETFL, flags);
-            *request = req;
-            return ncclSystemError;
-        }
-        req->offset += sent;
-    }
-
-    // All data sent
-    fcntl(comm->sock, F_SETFL, flags);
-    req->done = 1;
+    // TICKET-10: TRULY ASYNC - return immediately!
+    // All I/O work happens in test(). This prevents ring deadlock where all ranks
+    // block in isend() and nobody calls irecv().
+    MESH_DEBUG("TCP isend: queued send request size=%d, queue depth=%d",
+               size, (comm->send_queue_head == req) ? 1 : 2);
     *request = req;
     return ncclSuccess;
 }
@@ -1798,140 +1721,11 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
         comm->recv_queue_tail = req;
     }
 
-    // Only try to receive data immediately if this is the head of the queue
-    // (i.e., no other requests are pending ahead of us)
-    if (comm->recv_queue_head != req) {
-        // There are other requests ahead - just return, test() will process in order
-        *request = req;
-        return ncclSuccess;
-    }
-
-    // Set socket to non-blocking for async receive
-    int flags = fcntl(comm->sock, F_GETFL, 0);
-    fcntl(comm->sock, F_SETFL, flags | O_NONBLOCK);
-
-    // Try to peek at the size header first to check availability
-    // TICKET-10: Handle EINTR properly
-    uint32_t net_size;
-    ssize_t recvd;
-    do {
-        recvd = recv(comm->sock, &net_size, sizeof(net_size), MSG_PEEK);
-    } while (recvd < 0 && errno == EINTR);
-
-    if (recvd == 0) {
-        // Connection closed
-        MESH_WARN("TCP irecv: Connection closed by peer");
-        comm->peer_failed = 1;
-        fcntl(comm->sock, F_SETFL, flags);
-        // Dequeue from head (this request is at head since we checked earlier)
-        comm->recv_queue_head = req->next;
-        if (comm->recv_queue_head == NULL) comm->recv_queue_tail = NULL;
-        __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
-        free(req);
-        return ncclSystemError;
-    } else if (recvd < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        // No data yet - will poll in test
-        fcntl(comm->sock, F_SETFL, flags);
-        *request = req;
-        return ncclSuccess;
-    } else if (recvd < (ssize_t)sizeof(net_size)) {
-        // Partial header or error - wait for more data in test()
-        if (recvd > 0) {
-            // Partial header available, poll again later
-            fcntl(comm->sock, F_SETFL, flags);
-            *request = req;
-            return ncclSuccess;
-        }
-        MESH_WARN("TCP irecv: Failed to receive header: %s", strerror(errno));
-        comm->peer_failed = 1;
-        comm->last_errno = errno;
-        fcntl(comm->sock, F_SETFL, flags);
-        // Dequeue from head
-        comm->recv_queue_head = req->next;
-        if (comm->recv_queue_head == NULL) comm->recv_queue_tail = NULL;
-        __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
-        free(req);
-        return ncclSystemError;
-    }
-
-    // Full header available via peek, now consume it
-    do {
-        recvd = recv(comm->sock, &net_size, sizeof(net_size), 0);
-    } while (recvd < 0 && errno == EINTR);
-
-    MESH_DEBUG("TCP irecv: received header net_size=0x%08x (raw bytes: %02x %02x %02x %02x)",
-               net_size,
-               ((unsigned char*)&net_size)[0], ((unsigned char*)&net_size)[1],
-               ((unsigned char*)&net_size)[2], ((unsigned char*)&net_size)[3]);
-
-    if (recvd != sizeof(net_size)) {
-        MESH_WARN("TCP irecv: Failed to consume header: %s", strerror(errno));
-        comm->peer_failed = 1;
-        comm->last_errno = errno;
-        fcntl(comm->sock, F_SETFL, flags);
-        // Dequeue from head
-        comm->recv_queue_head = req->next;
-        if (comm->recv_queue_head == NULL) comm->recv_queue_tail = NULL;
-        __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
-        free(req);
-        return ncclSystemError;
-    }
-
-    uint32_t msg_size = ntohl(net_size);
-    MESH_DEBUG("TCP irecv: msg_size=%u (after ntohl), buffer_size=%d", msg_size, sizes[0]);
-    if (msg_size > (uint32_t)sizes[0]) {
-        MESH_WARN("TCP irecv: Message too large (%u > %d)", msg_size, sizes[0]);
-        fcntl(comm->sock, F_SETFL, flags);
-        // Dequeue from head
-        comm->recv_queue_head = req->next;
-        if (comm->recv_queue_head == NULL) comm->recv_queue_tail = NULL;
-        __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
-        free(req);
-        return ncclSystemError;
-    }
-
-    req->header_recvd = 1;
-    req->msg_size = msg_size;
-
-    // Try to receive as much data as possible without blocking
-    // TICKET-10: Handle EINTR properly
-    while (req->offset < msg_size) {
-        do {
-            recvd = recv(comm->sock, (char *)data[0] + req->offset, msg_size - req->offset, 0);
-        } while (recvd < 0 && errno == EINTR);
-
-        if (recvd == 0) {
-            // Connection closed before all data received
-            MESH_WARN("TCP irecv: Connection closed during data receive");
-            comm->peer_failed = 1;
-            req->error = ECONNRESET;
-            req->done = 1;
-            fcntl(comm->sock, F_SETFL, flags);
-            *request = req;
-            return ncclSystemError;
-        } else if (recvd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // No more data available - return for async completion in test()
-                fcntl(comm->sock, F_SETFL, flags);
-                *request = req;
-                return ncclSuccess;
-            }
-            MESH_WARN("TCP irecv: Failed to receive data: %s", strerror(errno));
-            comm->peer_failed = 1;
-            comm->last_errno = errno;
-            req->error = errno;
-            req->done = 1;
-            fcntl(comm->sock, F_SETFL, flags);
-            *request = req;
-            return ncclSystemError;
-        }
-        req->offset += recvd;
-    }
-
-    // All data received
-    fcntl(comm->sock, F_SETFL, flags);
-    req->size = msg_size;
-    req->done = 1;
+    // TICKET-10: TRULY ASYNC - return immediately!
+    // All I/O work happens in test(). This prevents ring deadlock where all ranks
+    // block in irecv() waiting for data that won't arrive because senders are also blocked.
+    MESH_DEBUG("TCP irecv: queued recv request size=%d, queue depth=%d",
+               sizes[0], (comm->recv_queue_head == req) ? 1 : 2);
     *request = req;
     return ncclSuccess;
 }
