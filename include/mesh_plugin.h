@@ -58,6 +58,7 @@ struct mesh_nic {
     int max_sge;
     uint64_t max_mr_size;
     int gdr_supported;          // GPUDirect RDMA support
+    enum ibv_mtu active_mtu;    // Port's active MTU (queried from hardware)
 
     // Statistics
     uint64_t bytes_sent;

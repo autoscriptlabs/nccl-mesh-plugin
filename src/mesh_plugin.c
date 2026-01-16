@@ -194,7 +194,11 @@ int mesh_setup_nic(struct mesh_nic *nic, struct ibv_device *device) {
         ibv_close_device(nic->context);
         return -1;
     }
-    
+
+    // Store the port's active MTU (TICKET-9: avoid MTU mismatch on RoCE)
+    nic->active_mtu = port_attr.active_mtu;
+    MESH_DEBUG("NIC %s port %d: active_mtu=%d", nic->dev_name, nic->port_num, nic->active_mtu);
+
     // Allocate protection domain
     nic->pd = ibv_alloc_pd(nic->context);
     if (!nic->pd) {
@@ -620,8 +624,8 @@ static void *handshake_thread_func(void *arg) {
         connect_handle.qp_num = ntohl(remote_info.qp_num);
         connect_handle.psn = ntohl(remote_info.psn);
         connect_handle.port_num = nic->port_num;
-        connect_handle.mtu = IBV_MTU_4096;
-        
+        connect_handle.mtu = nic->active_mtu;  // Use NIC's actual MTU (TICKET-9)
+
         // Construct GID from remote IP
         union ibv_gid remote_gid;
         memset(&remote_gid, 0, sizeof(remote_gid));
@@ -753,10 +757,15 @@ int mesh_connect_qp(struct ibv_qp *qp, struct mesh_nic *nic, struct mesh_handle 
 
     // Transition to RTR (Ready to Receive)
     // This is where most timeouts occur - remote QP may not be ready yet
+    // Use the MTU from connect_handle (caller negotiates min of local/remote)
+    enum ibv_mtu path_mtu = remote->mtu ? remote->mtu : nic->active_mtu;
+    MESH_DEBUG("QP connect: using path_mtu=%d (remote->mtu=%d, nic->active_mtu=%d)",
+               path_mtu, remote->mtu, nic->active_mtu);
+
     for (int attempt = 0; attempt < max_retries; attempt++) {
         memset(&qp_attr, 0, sizeof(qp_attr));
         qp_attr.qp_state = IBV_QPS_RTR;
-        qp_attr.path_mtu = IBV_MTU_4096;
+        qp_attr.path_mtu = path_mtu;
         qp_attr.dest_qp_num = remote->qp_num;
         qp_attr.rq_psn = remote->psn;
         qp_attr.max_dest_rd_atomic = 1;
@@ -1116,7 +1125,7 @@ static void *async_connect_thread_func(void *arg) {
             connect_handle.qp_num = ntohl(remote_info.qp_num);
             connect_handle.psn = ntohl(remote_info.psn);
             connect_handle.port_num = req->nic->port_num;
-            connect_handle.mtu = IBV_MTU_4096;
+            connect_handle.mtu = req->nic->active_mtu;  // Use NIC's actual MTU (TICKET-9)
 
             // Construct peer GID
             union ibv_gid peer_gid;
@@ -2149,7 +2158,7 @@ static ncclResult_t mesh_listen(int dev, void *handle, void **listenComm) {
     h->num_addrs = 0;
     h->psn = comm->psn;
     h->port_num = 1;
-    h->mtu = IBV_MTU_4096;
+    h->mtu = comm->qps[0].nic->active_mtu;  // Use NIC's actual MTU (TICKET-9)
     h->handshake_port = comm->handshake_port;
     // Store first NIC IP in handle - but connector will use selected_addr->ip for handshake
     h->handshake_ip = htonl(comm->qps[0].nic->ip_addr);
@@ -2343,7 +2352,9 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
     connect_handle.psn = ntohl(remote_qp_info.psn);
     connect_handle.lid = 0;  // RoCE uses GID, not LID
     connect_handle.port_num = nic->port_num;
-    connect_handle.mtu = IBV_MTU_4096;
+    // Negotiate MTU: use minimum of local and remote (TICKET-9)
+    connect_handle.mtu = (handle->mtu && handle->mtu < nic->active_mtu)
+                         ? handle->mtu : nic->active_mtu;
 
     // Construct peer GID from their IP
     union ibv_gid peer_gid;
