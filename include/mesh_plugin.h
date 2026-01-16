@@ -252,8 +252,10 @@ struct mesh_tcp_recv_comm {
     // Buffer for message framing
     uint8_t recv_hdr[8];        // Size header for message framing
 
-    // TICKET-10: Track pending request to prevent overlapping reads
-    struct mesh_tcp_request *pending_req;  // Current in-progress request (NULL if none)
+    // TICKET-10: FIFO queue for pending receive requests
+    // TCP delivers data in-order, so requests must complete in FIFO order
+    struct mesh_tcp_request *recv_queue_head;  // Oldest pending request (dequeue from here)
+    struct mesh_tcp_request *recv_queue_tail;  // Newest pending request (enqueue here)
 };
 
 struct mesh_tcp_request {
@@ -268,6 +270,7 @@ struct mesh_tcp_request {
     int header_sent;            // TICKET-10: 1 if size header already sent (send only)
     int header_recvd;           // TICKET-10: 1 if size header already received (recv only)
     size_t msg_size;            // TICKET-10: Actual message size from header (recv only)
+    struct mesh_tcp_request *next;  // TICKET-10: Next request in FIFO queue (recv only)
 };
 
 /*
