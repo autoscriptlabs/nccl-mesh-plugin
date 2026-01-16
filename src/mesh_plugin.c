@@ -1608,6 +1608,7 @@ static ncclResult_t mesh_tcp_regMr(void *comm, void *data, size_t size, int type
 
 /*
  * TCP send - send data over TCP socket with framing
+ * TICKET-10: Made truly async to prevent deadlock on large transfers
  */
 static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag,
                                    void *mhandle, void **request) {
@@ -1639,40 +1640,67 @@ static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag
     req->comm = comm;
     req->done = 0;
     req->error = 0;
+    req->offset = 0;
+    req->header_sent = 0;
 
-    // Send size header (4 bytes, network byte order)
+    // Set socket to non-blocking for async send
+    int flags = fcntl(comm->sock, F_GETFL, 0);
+    fcntl(comm->sock, F_SETFL, flags | O_NONBLOCK);
+
+    // Try to send size header (4 bytes, network byte order)
     uint32_t net_size = htonl(size);
     ssize_t sent = send(comm->sock, &net_size, sizeof(net_size), MSG_NOSIGNAL);
-    if (sent != sizeof(net_size)) {
+    if (sent < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // Can't even send header yet - return for polling
+            fcntl(comm->sock, F_SETFL, flags);
+            *request = req;
+            return ncclSuccess;
+        }
         MESH_WARN("TCP isend: Failed to send header: %s", strerror(errno));
         comm->peer_failed = 1;
         comm->last_errno = errno;
+        fcntl(comm->sock, F_SETFL, flags);
         __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
         free(req);
         return ncclSystemError;
     }
+    if (sent != sizeof(net_size)) {
+        // Partial header send - treat as error (4 bytes should always fit)
+        MESH_WARN("TCP isend: Partial header send (%zd/%zu)", sent, sizeof(net_size));
+        comm->peer_failed = 1;
+        fcntl(comm->sock, F_SETFL, flags);
+        __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+        free(req);
+        return ncclSystemError;
+    }
+    req->header_sent = 1;
 
-    // Send data
-    size_t total_sent = 0;
-    while (total_sent < (size_t)size) {
-        sent = send(comm->sock, (char *)data + total_sent, size - total_sent, MSG_NOSIGNAL);
+    // Try to send as much data as possible without blocking
+    while (req->offset < (size_t)size) {
+        sent = send(comm->sock, (char *)data + req->offset, size - req->offset, MSG_NOSIGNAL);
         if (sent <= 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(100);
-                continue;
+                // Socket buffer full - return for async completion in test()
+                fcntl(comm->sock, F_SETFL, flags);
+                *request = req;
+                return ncclSuccess;
             }
             MESH_WARN("TCP isend: Failed to send data: %s", strerror(errno));
             comm->peer_failed = 1;
             comm->last_errno = errno;
             req->error = errno;
             req->done = 1;
+            fcntl(comm->sock, F_SETFL, flags);
             *request = req;
             return ncclSystemError;
         }
-        total_sent += sent;
+        req->offset += sent;
     }
 
-    req->done = 1;  // TCP sends are synchronous for simplicity
+    // All data sent
+    fcntl(comm->sock, F_SETFL, flags);
+    req->done = 1;
     *request = req;
     return ncclSuccess;
 }
@@ -1933,6 +1961,86 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
             free(req);  // TICKET-8: Free request on connection error
             return ncclSystemError;
         }
+    }
+
+    // TICKET-10: For incomplete send, continue sending data
+    if (req->is_send && req->comm) {
+        struct mesh_tcp_send_comm *comm = (struct mesh_tcp_send_comm *)req->comm;
+
+        // Set socket to non-blocking
+        int flags = fcntl(comm->sock, F_GETFL, 0);
+        fcntl(comm->sock, F_SETFL, flags | O_NONBLOCK);
+
+        // If header not sent yet, try to send it
+        if (!req->header_sent) {
+            uint32_t net_size = htonl(req->size);
+            ssize_t sent = send(comm->sock, &net_size, sizeof(net_size), MSG_NOSIGNAL);
+            if (sent < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    fcntl(comm->sock, F_SETFL, flags);
+                    *done = 0;
+                    return ncclSuccess;
+                }
+                MESH_WARN("TCP test: Failed to send header: %s", strerror(errno));
+                comm->peer_failed = 1;
+                req->error = errno;
+                req->done = 1;
+                *done = 1;
+                fcntl(comm->sock, F_SETFL, flags);
+                __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
+                free(req);
+                return ncclSystemError;
+            }
+            if (sent != sizeof(net_size)) {
+                MESH_WARN("TCP test: Partial header send");
+                comm->peer_failed = 1;
+                req->error = EPROTO;
+                req->done = 1;
+                *done = 1;
+                fcntl(comm->sock, F_SETFL, flags);
+                __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
+                free(req);
+                return ncclSystemError;
+            }
+            req->header_sent = 1;
+        }
+
+        // Continue sending data from where we left off
+        while (req->offset < req->size) {
+            ssize_t sent = send(comm->sock, (char *)req->data + req->offset,
+                               req->size - req->offset, MSG_NOSIGNAL);
+            if (sent <= 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // Socket buffer full - return for more polling
+                    fcntl(comm->sock, F_SETFL, flags);
+                    *done = 0;
+                    return ncclSuccess;
+                }
+                MESH_WARN("TCP test: Failed to send data: %s", strerror(errno));
+                comm->peer_failed = 1;
+                req->error = errno;
+                req->done = 1;
+                *done = 1;
+                fcntl(comm->sock, F_SETFL, flags);
+                __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
+                free(req);
+                return ncclSystemError;
+            }
+            req->offset += sent;
+        }
+
+        // All data sent
+        fcntl(comm->sock, F_SETFL, flags);
+        req->done = 1;
+        *done = 1;
+        if (sizes) *sizes = req->size;
+        __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
+        free(req);
+        return ncclSuccess;
     }
 
     // Check if request was completed in isend/irecv (synchronous completion)
