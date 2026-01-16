@@ -39,7 +39,6 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import (
     MixedPrecision,
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from datasets import load_dataset
 import functools
 
 # 8-bit Adam from bitsandbytes
