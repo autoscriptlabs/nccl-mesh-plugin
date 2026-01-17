@@ -157,6 +157,10 @@ def main():
     parser.add_argument("--deepspeed", type=str, default=None)
     args = parser.parse_args()
 
+    # Check if model path exists locally
+    if not os.path.exists(args.model_path):
+        raise FileNotFoundError(f"Model path does not exist: {args.model_path}")
+
     # Initialize distributed
     deepspeed.init_distributed()
     args.world_size = dist.get_world_size()
@@ -178,8 +182,12 @@ def main():
         print(f"Max sequence length: {args.max_seq_length}")
         print("=" * 60)
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    # Load tokenizer (local_files_only=True for local paths)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path,
+        trust_remote_code=True,
+        local_files_only=True
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -195,6 +203,7 @@ def main():
             args.model_path,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
+            local_files_only=True,
             use_cache=False,  # Required for gradient checkpointing
         )
 
