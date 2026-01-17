@@ -34,7 +34,7 @@ LEARNING_RATE="2e-5"
 MAX_SEQ_LENGTH=512
 BATCH_SIZE=1
 GRAD_ACCUM=16
-CHECKPOINT_DIR="/mnt/nas/checkpoints/qwen14b"
+CHECKPOINT_DIR="/home/titanic/nccl-mesh-plugin/checkpoints"
 SAVE_STEPS=500
 RESUME=""
 
