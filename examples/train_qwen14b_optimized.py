@@ -58,10 +58,10 @@ def get_model_config():
         "model_id": "/mnt/nas/public/models/Qwen/Qwen2.5-Coder-14B-Instruct",
         "torch_dtype": torch.bfloat16,
 
-        # Training - can use larger batch with 14B
-        "micro_batch_size": 2,          # Per-device batch size (can be larger now)
-        "gradient_accumulation_steps": 8,  # Effective batch = 2 * 3 * 8 = 48
-        "max_seq_length": 2048,
+        # Training - conservative settings to avoid OOM during FSDP gather
+        "micro_batch_size": 1,           # Reduced from 2 to avoid OOM
+        "gradient_accumulation_steps": 16,  # Increased to maintain effective batch = 1 * 3 * 16 = 48
+        "max_seq_length": 1024,          # Reduced from 2048 to save activation memory
         "learning_rate": 2e-5,
         "warmup_ratio": 0.03,
         "num_epochs": 1,
@@ -332,6 +332,15 @@ def main():
 
     if accelerator.is_main_process:
         print(f"\nStarting training for {max_steps} steps...")
+
+    # Clear memory before training starts
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    if accelerator.is_main_process:
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        print(f"After memory cleanup: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved")
 
     for epoch in range(config["num_epochs"]):
         # Accelerate may replace our DistributedSampler, so check for set_epoch
