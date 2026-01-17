@@ -175,8 +175,19 @@ def load_dataset_from_jsonl(path, tokenizer, max_length):
         def __getitem__(self, idx):
             sample = self.samples[idx]
 
-            # Assume dataset has 'text' or 'content' field
-            text = sample.get('text') or sample.get('content') or str(sample)
+            # SQL dataset format: question, query, db_id, context, source
+            context = sample.get('context', '')
+            question = sample.get('question', '')
+            query = sample.get('query', '')
+
+            # Format as training prompt
+            text = f"""<schema>
+{context}
+</schema>
+
+Question: {question}
+
+SQL: {query}"""
 
             # Tokenize
             tokens = self.tokenizer(
