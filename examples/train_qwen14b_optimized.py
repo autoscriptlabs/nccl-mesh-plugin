@@ -55,7 +55,7 @@ def get_model_config():
     """Configuration for 14B model on 3x117GB nodes."""
     return {
         # Model - 14B is much more comfortable on 351GB cluster
-        "model_id": "/home/titanic/models/Qwen__Qwen2.5-Coder-14B-Instruct",
+        "model_id": "/mnt/nas/models/Qwen2.5-Coder-14B-Instruct",
         "torch_dtype": torch.bfloat16,
 
         # Training - can use larger batch with 14B
