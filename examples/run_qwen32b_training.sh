@@ -76,12 +76,17 @@ if [ -n "$SLURM_JOB_ID" ]; then
          --ntasks-per-node=1 \
          --cpus-per-task=12 \
          --export=ALL \
-         torchrun \
-            --nproc_per_node=1 \
-            --nnodes=${NUM_NODES} \
-            --rdzv_backend=c10d \
-            --rdzv_endpoint=${HEAD_NODE}:29500 \
-            ${TRAIN_SCRIPT} ${DRY_RUN} ${MAX_STEPS}
+         bash -c "export LD_LIBRARY_PATH=/home/titanic/nccl-mesh-plugin:\${LD_LIBRARY_PATH:-} && \
+                  export NCCL_NET_PLUGIN=mesh && \
+                  export NCCL_DEBUG=INFO && \
+                  export NCCL_MESH_DEBUG=1 && \
+                  export NCCL_SOCKET_IFNAME=enP7s7 && \
+                  torchrun \
+                     --nproc_per_node=1 \
+                     --nnodes=${NUM_NODES} \
+                     --rdzv_backend=c10d \
+                     --rdzv_endpoint=${HEAD_NODE}:29500 \
+                     ${TRAIN_SCRIPT} ${DRY_RUN} ${MAX_STEPS}"
 else
     echo "Not running under SLURM - use sbatch or srun"
     echo ""
