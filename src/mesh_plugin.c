@@ -3200,7 +3200,118 @@ static ncclResult_t mesh_irecvConsumed(void *recvComm, int n, void *request) {
 
 /*
  * ============================================================================
- * Plugin Export
+ * v9 API Wrappers
+ * ============================================================================
+ */
+
+/* Static string storage for v9 properties (name and pciPath become pointers) */
+static char g_v9_name_storage[256];
+static char g_v9_pcipath_storage[256];
+
+static ncclResult_t mesh_getProperties_v9(int dev, ncclNetProperties_v9_t *props) {
+    if (dev < 0 || dev >= g_mesh_state.num_nics) {
+        return ncclInvalidArgument;
+    }
+
+    struct mesh_nic *nic = &g_mesh_state.nics[dev];
+
+    memset(props, 0, sizeof(*props));
+
+    /* v9 uses pointers for name and pciPath */
+    strncpy(g_v9_name_storage, nic->dev_name, sizeof(g_v9_name_storage) - 1);
+    strncpy(g_v9_pcipath_storage, nic->pci_path, sizeof(g_v9_pcipath_storage) - 1);
+
+    props->name = g_v9_name_storage;
+    props->pciPath = g_v9_pcipath_storage;
+    props->guid = 0;
+    props->ptrSupport = NCCL_PTR_HOST;
+    props->regIsGlobal = 0;
+    props->forceFlush = 0;
+    props->speed = 100000;  /* 100 Gbps */
+    props->port = nic->port_num;
+    props->latency = 1.0f;
+    props->maxComms = nic->max_qp;
+    props->maxRecvs = 1;
+    props->netDeviceType = NCCL_NET_DEVICE_HOST;
+    props->netDeviceVersion = NCCL_NET_DEVICE_INVALID_VERSION;
+    props->vProps.ndevs = 0;
+    props->vProps.devs = NULL;
+    props->maxP2pBytes = NCCL_MAX_NET_SIZE_BYTES;
+    props->maxCollBytes = NCCL_MAX_NET_SIZE_BYTES;
+
+    return ncclSuccess;
+}
+
+static ncclResult_t mesh_isend_v9(void *sendComm, void *data, size_t size, int tag,
+                                  void *mhandle, void **request) {
+    /* v9 uses size_t, v8 uses int - cast for now (safe for typical message sizes) */
+    return mesh_isend(sendComm, data, (int)size, tag, mhandle, request);
+}
+
+static ncclResult_t mesh_irecv_v9(void *recvComm, int n, void **data, size_t *sizes,
+                                  int *tags, void **mhandles, void **request) {
+    /* v9 uses size_t* for sizes, need to convert */
+    int int_sizes[NCCL_NET_MAX_REQUESTS];
+    ncclResult_t ret;
+
+    for (int i = 0; i < n && i < NCCL_NET_MAX_REQUESTS; i++) {
+        int_sizes[i] = (int)sizes[i];
+    }
+
+    ret = mesh_irecv(recvComm, n, data, int_sizes, tags, mhandles, request);
+
+    /* Copy sizes back (they may be updated) */
+    for (int i = 0; i < n && i < NCCL_NET_MAX_REQUESTS; i++) {
+        sizes[i] = (size_t)int_sizes[i];
+    }
+
+    return ret;
+}
+
+static ncclResult_t mesh_makeVDevice(int *d, ncclNetVDeviceProps_v9_t *props) {
+    /* Virtual device not supported */
+    (void)d;
+    (void)props;
+    return ncclInternalError;
+}
+
+/*
+ * ============================================================================
+ * Plugin Export v9
+ * ============================================================================
+ */
+
+__attribute__((visibility("default")))
+const ncclNet_v9_t ncclNetPlugin_v9 = {
+    .name = PLUGIN_NAME,
+    .init = mesh_init,
+    .devices = mesh_devices,
+    .getProperties = mesh_getProperties_v9,
+    .listen = mesh_listen,
+    .connect = mesh_connect,
+    .accept = mesh_accept,
+    .regMr = mesh_regMr,
+    .regMrDmaBuf = mesh_regMrDmaBuf,
+    .deregMr = mesh_deregMr,
+    .isend = mesh_isend_v9,
+    .irecv = mesh_irecv_v9,
+    .iflush = mesh_iflush,
+    .test = mesh_test,
+    .closeSend = mesh_closeSend,
+    .closeRecv = mesh_closeRecv,
+    .closeListen = mesh_closeListen,
+    .getDeviceMr = mesh_getDeviceMr,
+    .irecvConsumed = mesh_irecvConsumed,
+    .makeVDevice = mesh_makeVDevice,
+};
+
+/* Alias for NCCL to find v9 */
+__attribute__((visibility("default")))
+const ncclNet_v9_t *ncclNet_v9 = &ncclNetPlugin_v9;
+
+/*
+ * ============================================================================
+ * Plugin Export v8 (for backward compatibility)
  * ============================================================================
  */
 
