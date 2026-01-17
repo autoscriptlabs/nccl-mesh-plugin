@@ -23,8 +23,8 @@ HEAD_NODE="${HEAD_NODE:-spark-a}"
 NODES="${NODES:-spark-a,spark-b,spark-c}"
 NUM_NODES="${NUM_NODES:-3}"
 
-# NCCL mesh plugin configuration
-export NCCL_NET_PLUGIN=mesh
+# NCCL mesh plugin configuration - use full path for reliable loading
+export NCCL_NET_PLUGIN=/home/titanic/nccl-mesh-plugin/libnccl-net-mesh.so
 export LD_LIBRARY_PATH=/home/titanic/nccl-mesh-plugin:${LD_LIBRARY_PATH:-}
 export NCCL_DEBUG=INFO
 export NCCL_MESH_DEBUG=1
@@ -76,8 +76,10 @@ if [ -n "$SLURM_JOB_ID" ]; then
          --ntasks-per-node=1 \
          --cpus-per-task=12 \
          --export=ALL \
-         bash -c "export LD_LIBRARY_PATH=/home/titanic/nccl-mesh-plugin:\${LD_LIBRARY_PATH:-} && \
-                  export NCCL_NET_PLUGIN=mesh && \
+         bash -c "echo \"[\$(hostname)] Checking mesh plugin...\" && \
+                  ls -la /home/titanic/nccl-mesh-plugin/libnccl-net*.so && \
+                  export LD_LIBRARY_PATH=/home/titanic/nccl-mesh-plugin:\${LD_LIBRARY_PATH:-} && \
+                  export NCCL_NET_PLUGIN=/home/titanic/nccl-mesh-plugin/libnccl-net-mesh.so && \
                   export NCCL_DEBUG=INFO && \
                   export NCCL_MESH_DEBUG=1 && \
                   export NCCL_SOCKET_IFNAME=enP7s7 && \
