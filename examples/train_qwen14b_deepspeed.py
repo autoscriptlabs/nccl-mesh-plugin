@@ -204,7 +204,7 @@ def main():
     # Load model with memory optimizations
     # Don't use zero.Init() - it doesn't work well with from_pretrained
     # Instead, use low_cpu_mem_usage to load shards incrementally
-    # Try flash_attention_2 - v2.8.3 may support sm121, falls back if not
+    # Note: flash_attention_2 hangs on sm121 GPUs, use eager instead
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype=torch.bfloat16,
@@ -212,7 +212,7 @@ def main():
         local_files_only=True,
         use_cache=False,  # Required for gradient checkpointing
         low_cpu_mem_usage=True,  # Load shards incrementally
-        attn_implementation="flash_attention_2",
+        attn_implementation="eager",  # FA2 hangs on sm121
     )
 
     # Enable gradient checkpointing before DeepSpeed init
@@ -257,15 +257,18 @@ def main():
     )
 
     if args.rank == 0:
-        print(f"\nStarting training for {args.max_steps} steps...")
+        print(f"\nStarting training for {args.max_steps} steps...", flush=True)
         allocated = torch.cuda.memory_allocated() / 1024**3
         reserved = torch.cuda.memory_reserved() / 1024**3
-        print(f"After DeepSpeed init: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved")
+        print(f"After DeepSpeed init: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved", flush=True)
 
     # Training loop
     model_engine.train()
     global_step = 0
     total_loss = 0.0
+
+    if args.rank == 0:
+        print("Starting first batch...", flush=True)
 
     for batch in dataloader:
         if global_step >= args.max_steps:
@@ -291,14 +294,21 @@ def main():
         total_loss += loss.item()
         global_step += 1
 
-        # Log progress
-        if global_step % 10 == 0 and args.rank == 0:
-            avg_loss = total_loss / 10
-            allocated = torch.cuda.memory_allocated() / 1024**3
-            reserved = torch.cuda.memory_reserved() / 1024**3
-            print(f"Step {global_step}/{args.max_steps} | Loss: {avg_loss:.4f} | "
-                  f"Memory: {allocated:.1f}GB/{reserved:.1f}GB")
-            total_loss = 0.0
+        # Log progress - every step for first 5, then every 10
+        if args.rank == 0 and (global_step <= 5 or global_step % 10 == 0):
+            if global_step <= 5:
+                # Detailed logging for first few steps
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                print(f"Step {global_step}/{args.max_steps} | Loss: {loss.item():.4f} | "
+                      f"Memory: {allocated:.1f}GB/{reserved:.1f}GB", flush=True)
+            else:
+                avg_loss = total_loss / 10
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                print(f"Step {global_step}/{args.max_steps} | Loss: {avg_loss:.4f} | "
+                      f"Memory: {allocated:.1f}GB/{reserved:.1f}GB", flush=True)
+                total_loss = 0.0
 
     if args.rank == 0:
         print("\nTraining complete!")
