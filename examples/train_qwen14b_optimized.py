@@ -334,7 +334,9 @@ def main():
         print(f"\nStarting training for {max_steps} steps...")
 
     for epoch in range(config["num_epochs"]):
-        dataloader.sampler.set_epoch(epoch)
+        # Accelerate may replace our DistributedSampler, so check for set_epoch
+        if hasattr(dataloader.sampler, 'set_epoch'):
+            dataloader.sampler.set_epoch(epoch)
 
         for step, batch in enumerate(dataloader):
             with accelerator.accumulate(model):
