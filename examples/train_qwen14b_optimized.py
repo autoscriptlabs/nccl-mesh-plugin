@@ -55,7 +55,7 @@ def get_model_config():
     """Configuration for 14B model on 3x117GB nodes."""
     return {
         # Model - 14B is much more comfortable on 351GB cluster
-        "model_id": "/mnt/nas/models/Qwen2.5-Coder-14B-Instruct",
+        "model_id": "/mnt/nas/public/models/Qwen/Qwen2.5-Coder-14B-Instruct",
         "torch_dtype": torch.bfloat16,
 
         # Training - can use larger batch with 14B
@@ -249,9 +249,14 @@ def main():
         print("=" * 60)
         print_memory_stats("Initial ")
 
+    # Verify model path exists (newer huggingface_hub has strict validation)
+    model_path = config["model_id"]
+    if not os.path.isdir(model_path):
+        raise FileNotFoundError(f"Model directory not found: {model_path}")
+
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
-        config["model_id"],
+        model_path,
         trust_remote_code=True,
         local_files_only=True,
     )
@@ -260,7 +265,7 @@ def main():
 
     # Load model with gradient checkpointing
     model = load_model_with_checkpointing(
-        config["model_id"],
+        model_path,
         config["torch_dtype"],
     )
 
