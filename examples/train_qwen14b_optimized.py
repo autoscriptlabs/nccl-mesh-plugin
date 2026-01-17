@@ -58,10 +58,10 @@ def get_model_config():
         "model_id": "/mnt/nas/public/models/Qwen/Qwen2.5-Coder-14B-Instruct",
         "torch_dtype": torch.bfloat16,
 
-        # Training - conservative settings to avoid OOM during FSDP gather
-        "micro_batch_size": 1,           # Reduced from 2 to avoid OOM
-        "gradient_accumulation_steps": 16,  # Increased to maintain effective batch = 1 * 3 * 16 = 48
-        "max_seq_length": 1024,          # Reduced from 2048 to save activation memory
+        # Training - minimal memory for FSDP on 117GB unified memory nodes
+        "micro_batch_size": 1,           # Minimum batch size
+        "gradient_accumulation_steps": 16,  # Effective batch = 1 * 3 * 16 = 48
+        "max_seq_length": 512,           # Reduced to 512 to minimize activation memory
         "learning_rate": 2e-5,
         "warmup_ratio": 0.03,
         "num_epochs": 1,
