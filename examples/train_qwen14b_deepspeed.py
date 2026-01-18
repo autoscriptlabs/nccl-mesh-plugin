@@ -13,6 +13,10 @@ Usage:
 import os
 import argparse
 import json
+import shutil
+import threading
+import time
+from queue import Queue
 import torch
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
@@ -22,6 +26,121 @@ from transformers import (
 )
 import deepspeed
 from deepspeed import comm as dist
+
+
+class AsyncCheckpointManager:
+    """
+    Manages async checkpoint copying from local disk to NAS.
+
+    Workflow:
+    1. Save checkpoint to fast local disk (blocking, but fast)
+    2. Background thread copies to NAS (non-blocking)
+    3. Once NAS copy verified, delete local copy
+    4. Training continues uninterrupted
+    """
+
+    def __init__(self, local_dir, nas_dir, rank=0):
+        self.local_dir = local_dir
+        self.nas_dir = nas_dir
+        self.rank = rank
+        self.copy_queue = Queue()
+        self.worker_thread = None
+        self.shutdown_flag = threading.Event()
+        self.pending_copies = []
+
+        # Create directories
+        if rank == 0:
+            os.makedirs(local_dir, exist_ok=True)
+            os.makedirs(nas_dir, exist_ok=True)
+
+        # Start background worker
+        self._start_worker()
+
+    def _start_worker(self):
+        """Start background copy worker thread."""
+        self.worker_thread = threading.Thread(target=self._copy_worker, daemon=True)
+        self.worker_thread.start()
+
+    def _copy_worker(self):
+        """Background worker that copies checkpoints to NAS."""
+        while not self.shutdown_flag.is_set():
+            try:
+                # Wait for work with timeout (allows checking shutdown flag)
+                try:
+                    local_path, nas_path, step = self.copy_queue.get(timeout=1.0)
+                except:
+                    continue
+
+                if self.rank == 0:
+                    print(f"[Checkpoint] Starting background copy of step {step} to NAS...", flush=True)
+
+                try:
+                    # Copy directory tree to NAS
+                    start_time = time.time()
+                    if os.path.exists(nas_path):
+                        shutil.rmtree(nas_path)
+                    shutil.copytree(local_path, nas_path)
+                    copy_time = time.time() - start_time
+
+                    # Verify copy by checking file count and total size
+                    local_size = self._get_dir_size(local_path)
+                    nas_size = self._get_dir_size(nas_path)
+
+                    if abs(local_size - nas_size) < 1024:  # Allow 1KB variance
+                        # Copy verified, safe to delete local
+                        if self.rank == 0:
+                            print(f"[Checkpoint] NAS copy verified ({nas_size/1e9:.1f}GB in {copy_time:.1f}s). Removing local copy.", flush=True)
+                        shutil.rmtree(local_path)
+                        self.pending_copies.remove(step)
+                    else:
+                        if self.rank == 0:
+                            print(f"[Checkpoint] WARNING: Size mismatch! Local={local_size}, NAS={nas_size}. Keeping local copy.", flush=True)
+
+                except Exception as e:
+                    if self.rank == 0:
+                        print(f"[Checkpoint] ERROR copying to NAS: {e}. Local copy preserved.", flush=True)
+
+                self.copy_queue.task_done()
+
+            except Exception as e:
+                if self.rank == 0:
+                    print(f"[Checkpoint] Worker error: {e}", flush=True)
+
+    def _get_dir_size(self, path):
+        """Get total size of directory in bytes."""
+        total = 0
+        for dirpath, dirnames, filenames in os.walk(path):
+            for f in filenames:
+                fp = os.path.join(dirpath, f)
+                total += os.path.getsize(fp)
+        return total
+
+    def get_local_path(self, name="latest"):
+        """Get local checkpoint path."""
+        return os.path.join(self.local_dir, name)
+
+    def queue_nas_copy(self, name, step):
+        """Queue a checkpoint for async copy to NAS."""
+        local_path = os.path.join(self.local_dir, name)
+        nas_path = os.path.join(self.nas_dir, name)
+        self.pending_copies.append(step)
+        self.copy_queue.put((local_path, nas_path, step))
+        if self.rank == 0:
+            print(f"[Checkpoint] Queued step {step} for NAS copy (training continues).", flush=True)
+
+    def wait_for_copies(self, timeout=300):
+        """Wait for all pending copies to complete (call at end of training)."""
+        if self.rank == 0 and self.pending_copies:
+            print(f"[Checkpoint] Waiting for {len(self.pending_copies)} pending NAS copies...", flush=True)
+        self.copy_queue.join()
+        if self.rank == 0:
+            print("[Checkpoint] All NAS copies complete.", flush=True)
+
+    def shutdown(self):
+        """Shutdown the background worker."""
+        self.shutdown_flag.set()
+        if self.worker_thread:
+            self.worker_thread.join(timeout=5)
 
 
 class SimpleDataset(Dataset):
@@ -157,7 +276,10 @@ def main():
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--max_steps", type=int, default=1000)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints")
+    parser.add_argument("--local_checkpoint_dir", type=str, default="/tmp/checkpoints",
+                        help="Fast local disk for checkpoint writes")
+    parser.add_argument("--nas_checkpoint_dir", type=str, default="/mnt/nas/titanic/checkpoints",
+                        help="NAS directory for durable checkpoint storage")
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                         help="Path to checkpoint to resume from, or 'latest' to auto-detect")
@@ -179,9 +301,12 @@ def main():
     torch.cuda.set_device(args.local_rank)
     device = torch.device("cuda", args.local_rank)
 
-    # Create checkpoint directory
-    if args.rank == 0:
-        os.makedirs(args.checkpoint_dir, exist_ok=True)
+    # Initialize async checkpoint manager (saves locally, copies to NAS in background)
+    ckpt_manager = AsyncCheckpointManager(
+        local_dir=args.local_checkpoint_dir,
+        nas_dir=args.nas_checkpoint_dir,
+        rank=args.rank
+    )
 
     if args.rank == 0:
         print("=" * 60)
@@ -192,7 +317,8 @@ def main():
         print(f"Gradient accumulation: {args.gradient_accumulation_steps}")
         print(f"Effective batch size: {args.batch_size * args.gradient_accumulation_steps * args.world_size}")
         print(f"Max sequence length: {args.max_seq_length}")
-        print(f"Checkpoint dir: {args.checkpoint_dir}")
+        print(f"Local checkpoint dir: {args.local_checkpoint_dir} (fast)")
+        print(f"NAS checkpoint dir: {args.nas_checkpoint_dir} (durable)")
         print(f"Save every: {args.save_steps} steps")
         print("=" * 60)
 
@@ -270,10 +396,18 @@ def main():
     start_step = 0
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint == "latest":
-            # Look for the "latest" checkpoint directory
-            latest_path = os.path.join(args.checkpoint_dir, "latest")
-            if os.path.exists(latest_path):
-                args.resume_from_checkpoint = latest_path
+            # Check NAS first (durable), then local
+            nas_latest = os.path.join(args.nas_checkpoint_dir, "latest")
+            local_latest = os.path.join(args.local_checkpoint_dir, "latest")
+
+            if os.path.exists(nas_latest):
+                args.resume_from_checkpoint = nas_latest
+                if args.rank == 0:
+                    print(f"Found checkpoint on NAS: {nas_latest}", flush=True)
+            elif os.path.exists(local_latest):
+                args.resume_from_checkpoint = local_latest
+                if args.rank == 0:
+                    print(f"Found checkpoint on local disk: {local_latest}", flush=True)
             else:
                 args.resume_from_checkpoint = None
                 if args.rank == 0:
@@ -342,23 +476,31 @@ def main():
                       f"Memory: {allocated:.1f}GB/{reserved:.1f}GB", flush=True)
                 total_loss = 0.0
 
-        # Save checkpoint (overwrites previous to save disk space)
+        # Save checkpoint to local disk, then async copy to NAS
         if global_step > 0 and global_step % args.save_steps == 0:
-            checkpoint_path = os.path.join(args.checkpoint_dir, "latest")
+            local_checkpoint_path = ckpt_manager.get_local_path("latest")
             if args.rank == 0:
-                print(f"Saving checkpoint at step {global_step} to {checkpoint_path}...", flush=True)
-            model_engine.save_checkpoint(checkpoint_path, client_state={'step': global_step})
+                print(f"Saving checkpoint at step {global_step} to local disk...", flush=True)
+            model_engine.save_checkpoint(local_checkpoint_path, client_state={'step': global_step})
             if args.rank == 0:
-                print(f"Checkpoint saved.", flush=True)
+                print(f"Checkpoint saved locally. Queuing NAS copy...", flush=True)
+            # Queue async copy to NAS (training continues immediately)
+            ckpt_manager.queue_nas_copy("latest", global_step)
 
-    # Save final checkpoint
-    final_checkpoint_path = os.path.join(args.checkpoint_dir, "final")
+    # Save final checkpoint to local, then async copy to NAS
+    final_local_path = ckpt_manager.get_local_path("final")
     if args.rank == 0:
-        print(f"Saving final checkpoint (step {global_step}) to {final_checkpoint_path}...", flush=True)
-    model_engine.save_checkpoint(final_checkpoint_path, client_state={'step': global_step})
+        print(f"Saving final checkpoint (step {global_step}) to local disk...", flush=True)
+    model_engine.save_checkpoint(final_local_path, client_state={'step': global_step})
+    ckpt_manager.queue_nas_copy("final", global_step)
+
+    # Wait for all NAS copies to complete before exiting
+    ckpt_manager.wait_for_copies()
+    ckpt_manager.shutdown()
 
     if args.rank == 0:
         print("\nTraining complete!")
+        print(f"Final checkpoint available at: {args.nas_checkpoint_dir}/final")
 
 
 if __name__ == "__main__":
