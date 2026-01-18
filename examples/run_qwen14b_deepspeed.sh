@@ -34,7 +34,7 @@ LEARNING_RATE="2e-5"
 MAX_SEQ_LENGTH=512
 BATCH_SIZE=1
 GRAD_ACCUM=16
-CHECKPOINT_DIR="/home/titanic/nccl-mesh-plugin/checkpoints"
+CHECKPOINT_DIR="/mnt/nas/titanic/checkpoints"
 SAVE_STEPS=500
 RESUME=""
 
@@ -86,7 +86,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --seq-length N     Max sequence length (default: 512)"
             echo "  --batch-size N     Batch size per GPU (default: 1)"
             echo "  --grad-accum N     Gradient accumulation steps (default: 16)"
-            echo "  --checkpoint-dir   Checkpoint directory (default: /mnt/nas/checkpoints/qwen14b)"
+            echo "  --checkpoint-dir   Checkpoint directory (default: /mnt/nas/titanic/checkpoints)"
             echo "  --save-steps N     Save checkpoint every N steps (default: 500)"
             echo "  --resume PATH      Resume from checkpoint (use 'latest' for auto-detect)"
             echo "  --help             Show this help message"
