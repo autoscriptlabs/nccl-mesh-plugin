@@ -114,6 +114,118 @@ const char* mesh_find_netdev_for_rdma(const char *rdma_dev) {
 }
 
 /*
+ * Check if a GID is an IPv4-mapped address (::ffff:a.b.c.d)
+ * IPv4-mapped GIDs have bytes 0-9 as 0x00, bytes 10-11 as 0xFFFF
+ */
+int mesh_gid_is_ipv4_mapped(const union ibv_gid *gid) {
+    if (!gid) return 0;
+
+    // Check bytes 0-9 are zero
+    for (int i = 0; i < 10; i++) {
+        if (gid->raw[i] != 0) return 0;
+    }
+    // Check bytes 10-11 are 0xFFFF
+    if (gid->raw[10] != 0xFF || gid->raw[11] != 0xFF) return 0;
+
+    // Check that the IPv4 part (bytes 12-15) is not all zeros
+    if (gid->raw[12] == 0 && gid->raw[13] == 0 &&
+        gid->raw[14] == 0 && gid->raw[15] == 0) return 0;
+
+    return 1;
+}
+
+/*
+ * Check if a GID is a link-local IPv6 address (fe80::...)
+ */
+int mesh_gid_is_link_local(const union ibv_gid *gid) {
+    if (!gid) return 0;
+    // Link-local addresses start with fe80::
+    return (gid->raw[0] == 0xFE && gid->raw[1] == 0x80);
+}
+
+/*
+ * Check if a GID is a RoCEv2 GID (bytes 0-3 are zero, valid for IPv4 routing)
+ */
+int mesh_gid_is_rocev2(const union ibv_gid *gid) {
+    if (!gid) return 0;
+    // RoCEv2 GIDs start with zeros (not fe80 link-local)
+    return (gid->raw[0] == 0 && gid->raw[1] == 0);
+}
+
+/*
+ * Extract IPv4 address from an IPv4-mapped GID
+ * Returns the IPv4 address in host byte order, or 0 if not IPv4-mapped
+ */
+uint32_t mesh_gid_to_ipv4(const union ibv_gid *gid) {
+    if (!mesh_gid_is_ipv4_mapped(gid)) return 0;
+
+    // IPv4 address is in bytes 12-15, network byte order
+    return ((uint32_t)gid->raw[12] << 24) |
+           ((uint32_t)gid->raw[13] << 16) |
+           ((uint32_t)gid->raw[14] << 8) |
+           ((uint32_t)gid->raw[15]);
+}
+
+/*
+ * Find a GID index with an IPv4-mapped address for the given NIC
+ * This is critical for RoCE connections where both ends must use compatible GID types
+ * Returns the GID index (0-based), or -1 if no IPv4-mapped GID is found
+ */
+int mesh_find_ipv4_gid_index(struct ibv_context *context, int port_num, uint32_t expected_ip) {
+    union ibv_gid gid;
+    int best_index = -1;
+
+    if (!context) return -1;
+
+    // Query port to get GID table length
+    struct ibv_port_attr port_attr;
+    if (ibv_query_port(context, port_num, &port_attr) != 0) {
+        MESH_WARN("Failed to query port for GID table scan");
+        return -1;
+    }
+
+    int max_gids = port_attr.gid_tbl_len;
+    if (max_gids > 16) max_gids = 16;  // Reasonable limit
+
+    MESH_DEBUG("Scanning %d GID entries for IPv4-mapped address", max_gids);
+
+    for (int i = 0; i < max_gids; i++) {
+        if (ibv_query_gid(context, port_num, i, &gid) != 0) {
+            continue;
+        }
+
+        // Skip all-zero GIDs
+        int all_zero = 1;
+        for (int j = 0; j < 16; j++) {
+            if (gid.raw[j] != 0) { all_zero = 0; break; }
+        }
+        if (all_zero) continue;
+
+        if (mesh_gid_is_ipv4_mapped(&gid)) {
+            uint32_t gid_ip = mesh_gid_to_ipv4(&gid);
+            char ip_buf[INET_ADDRSTRLEN];
+            mesh_uint_to_ip(gid_ip, ip_buf, sizeof(ip_buf));
+            MESH_DEBUG("GID[%d] is IPv4-mapped: %s", i, ip_buf);
+
+            // If we have an expected IP, prefer the matching one
+            if (expected_ip != 0 && gid_ip == expected_ip) {
+                MESH_DEBUG("GID[%d] matches expected IP, selecting", i);
+                return i;
+            }
+
+            // Otherwise, remember the first IPv4-mapped GID as fallback
+            if (best_index < 0) {
+                best_index = i;
+            }
+        } else if (mesh_gid_is_link_local(&gid)) {
+            MESH_DEBUG("GID[%d] is link-local IPv6 (skipping)", i);
+        }
+    }
+
+    return best_index;
+}
+
+/*
  * Find the NIC that can reach a given IP address (same subnet)
  */
 struct mesh_nic* mesh_find_nic_for_ip(uint32_t peer_ip) {
@@ -208,12 +320,34 @@ int mesh_setup_nic(struct mesh_nic *nic, struct ibv_device *device) {
         return -1;
     }
     
-    // Use configured GID index or default to 3 (RoCE v2 with IPv4)
-    nic->gid_index = g_mesh_state.gid_index;
+    // Auto-discover GID index with IPv4-mapped address for RoCE compatibility
+    // This is critical for 4-node line topology where different nodes may have
+    // different GID table layouts (some with IPv4-mapped at index 3, others elsewhere)
+    int auto_gid_index = mesh_find_ipv4_gid_index(nic->context, nic->port_num, nic->ip_addr);
+
+    if (auto_gid_index >= 0) {
+        nic->gid_index = auto_gid_index;
+        MESH_INFO("NIC %s: auto-discovered IPv4-mapped GID at index %d",
+                  nic->dev_name, nic->gid_index);
+    } else {
+        // Fall back to configured value (default 3)
+        nic->gid_index = g_mesh_state.gid_index;
+        MESH_WARN("NIC %s: no IPv4-mapped GID found, using configured index %d (may cause connection failures)",
+                  nic->dev_name, nic->gid_index);
+    }
 
     // Cache the GID at initialization (TICKET-5)
     if (mesh_cache_gid(nic) != 0) {
         MESH_WARN("Failed to cache GID for %s, will query on demand", nic->dev_name);
+    }
+
+    // Validate that the selected GID is IPv4-mapped
+    if (nic->gid_valid && !mesh_gid_is_ipv4_mapped(&nic->cached_gid)) {
+        MESH_WARN("NIC %s: GID at index %d is NOT IPv4-mapped - RoCE connections may fail!",
+                  nic->dev_name, nic->gid_index);
+        if (mesh_gid_is_link_local(&nic->cached_gid)) {
+            MESH_WARN("  GID is link-local IPv6 (fe80::...) - check RoCE configuration");
+        }
     }
 
     MESH_INFO("Initialized NIC %s: max_qp=%d, max_mr=%d, gid_index=%d",
@@ -755,6 +889,27 @@ int mesh_connect_qp(struct ibv_qp *qp, struct mesh_nic *nic, struct mesh_handle 
     int ret;
     int max_retries = 5;
     int retry_delay_ms = 10;  // Start with 10ms, double each retry
+
+    // Validate GID type compatibility before attempting RTR transition
+    // This is critical for 4-node line topology with mixed RoCE configurations
+    union ibv_gid local_gid;
+    if (mesh_get_gid(nic, &local_gid) == 0) {
+        int local_ipv4 = mesh_gid_is_ipv4_mapped(&local_gid);
+        int remote_ipv4 = mesh_gid_is_ipv4_mapped(&remote->gid);
+        int local_linklocal = mesh_gid_is_link_local(&local_gid);
+        int remote_linklocal = mesh_gid_is_link_local(&remote->gid);
+
+        if (local_ipv4 != remote_ipv4 || local_linklocal != remote_linklocal) {
+            MESH_WARN("GID type mismatch detected:");
+            MESH_WARN("  Local GID (index %d): %s",
+                      nic->gid_index,
+                      local_ipv4 ? "IPv4-mapped" : (local_linklocal ? "link-local IPv6" : "other"));
+            MESH_WARN("  Remote GID: %s",
+                      remote_ipv4 ? "IPv4-mapped" : (remote_linklocal ? "link-local IPv6" : "other"));
+            MESH_WARN("  This will likely cause ibv_modify_qp to fail with EINVAL (22)");
+            MESH_WARN("  Check that all nodes have IPv4 addresses on their RoCE interfaces");
+        }
+    }
 
     // Transition to RTR (Ready to Receive)
     // This is where most timeouts occur - remote QP may not be ready yet
