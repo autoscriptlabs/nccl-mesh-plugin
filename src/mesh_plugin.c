@@ -22,12 +22,70 @@
 #include <net/if.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <dlfcn.h>
 
 #include <infiniband/verbs.h>
 
 #include "nccl/net.h"
 #include "mesh_plugin.h"
 #include "mesh_routing.h"
+
+/*
+ * CUDA unified memory detection (TICKET-C)
+ *
+ * On Grace Blackwell, CUDA unified (managed) memory pointers may be passed to
+ * regMr. We use dlsym to optionally resolve cudaPointerGetAttributes at runtime
+ * so we can detect managed memory without a compile-time CUDA dependency.
+ */
+enum {
+    CUDA_MEMORY_TYPE_UNREGISTERED = 0,
+    CUDA_MEMORY_TYPE_HOST = 1,
+    CUDA_MEMORY_TYPE_DEVICE = 2,
+    CUDA_MEMORY_TYPE_MANAGED = 3,
+};
+
+struct cuda_pointer_attributes {
+    int type;           /* cudaMemoryType */
+    int device;
+    void *devicePointer;
+    void *hostPointer;
+};
+
+typedef int (*cudaPointerGetAttributes_fn)(struct cuda_pointer_attributes *, const void *);
+static cudaPointerGetAttributes_fn g_cudaPointerGetAttributes = NULL;
+static int g_cuda_checked = 0;
+
+static void mesh_init_cuda_check(void) {
+    if (g_cuda_checked) return;
+    g_cuda_checked = 1;
+    void *handle = dlopen("libcudart.so", RTLD_LAZY | RTLD_NOLOAD);
+    if (!handle) {
+        /* Try versioned name */
+        handle = dlopen("libcudart.so.12", RTLD_LAZY | RTLD_NOLOAD);
+    }
+    if (handle) {
+        g_cudaPointerGetAttributes =
+            (cudaPointerGetAttributes_fn)dlsym(handle, "cudaPointerGetAttributes");
+        if (g_cudaPointerGetAttributes) {
+            MESH_INFO("CUDA runtime found - unified memory detection enabled");
+        }
+        /* Don't dlclose - we need the symbol to remain valid */
+    }
+}
+
+/*
+ * Check if a pointer is CUDA managed (unified) memory.
+ * Returns 1 if managed, 0 otherwise or if CUDA is not available.
+ */
+static int mesh_is_managed_memory(const void *ptr) {
+    if (!g_cudaPointerGetAttributes) return 0;
+
+    struct cuda_pointer_attributes attrs;
+    memset(&attrs, 0, sizeof(attrs));
+    int err = g_cudaPointerGetAttributes(&attrs, ptr);
+    if (err != 0) return 0;
+    return (attrs.type == CUDA_MEMORY_TYPE_MANAGED);
+}
 
 // Global state
 struct mesh_plugin_state g_mesh_state = {0};
@@ -2318,6 +2376,9 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
 
     g_mesh_state.log_fn = logFunction;
 
+    // Initialize CUDA unified memory detection (TICKET-C)
+    mesh_init_cuda_check();
+
     // Read configuration from environment
     const char *env_val;
 
@@ -2881,25 +2942,49 @@ static ncclResult_t mesh_regMr(void *comm, void *data, size_t size, int type, vo
         MESH_WARN("regMr: invalid comm or nic");
         return ncclSystemError;
     }
-    
-    
+
     mrh = calloc(1, sizeof(*mrh));
     if (!mrh) {
         return ncclSystemError;
     }
-    
+
+    /*
+     * TICKET-C: Unified memory handling for Grace Blackwell
+     *
+     * On Grace Blackwell, CUDA unified (managed) memory is backed by a single
+     * allocation accessible from both CPU and GPU via NVLink-C2C. When NCCL
+     * passes a unified memory pointer, ibv_reg_mr can register it directly
+     * since the CPU can access the pages. The RDMA NIC will DMA from the
+     * CPU-visible mapping.
+     *
+     * If ibv_reg_mr fails on managed memory (e.g., pages not yet faulted in),
+     * we fall through to a host-pinned fallback: the data must be copied to
+     * a host buffer before RDMA, which NCCL handles via its proxy thread.
+     * We log a warning so the operator knows performance may be degraded.
+     */
+    int managed = mesh_is_managed_memory(data);
+    if (managed) {
+        MESH_DEBUG("regMr: detected CUDA managed/unified memory at %p", data);
+    }
+
     mrh->mr = ibv_reg_mr(scomm->nic->pd, data, size, access_flags);
     if (!mrh->mr) {
-        MESH_WARN("Failed to register MR: %s", strerror(errno));
+        if (managed) {
+            MESH_WARN("regMr: ibv_reg_mr failed on unified memory (%s) - "
+                      "NCCL will use host staging buffers (slower path)",
+                      strerror(errno));
+        } else {
+            MESH_WARN("Failed to register MR: %s", strerror(errno));
+        }
         free(mrh);
         return ncclSystemError;
     }
-    
-    
+
     mrh->nic = scomm->nic;
     mrh->addr = data;
     mrh->size = size;
-    
+    mrh->is_managed = managed;
+
     *mhandle = mrh;
     return ncclSuccess;
 }

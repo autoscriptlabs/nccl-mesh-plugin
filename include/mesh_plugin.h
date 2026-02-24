@@ -213,6 +213,7 @@ struct mesh_mr_handle {
     void *addr;
     size_t size;
     int is_tcp;                 // 1 if this is a TCP fallback registration
+    int is_managed;             // 1 if pointer is CUDA unified/managed memory
 };
 
 /*
