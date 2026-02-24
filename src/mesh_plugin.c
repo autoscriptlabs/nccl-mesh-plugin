@@ -1535,6 +1535,12 @@ int mesh_tcp_init(void) {
     MESH_WARN("TCP fallback mode activated - RDMA not available or disabled");
     g_mesh_state.tcp_fallback_active = 1;
 
+    // TICKET-E: Respect NCCL_SOCKET_IFNAME to filter interfaces
+    const char *socket_ifname = getenv("NCCL_SOCKET_IFNAME");
+    if (socket_ifname && socket_ifname[0]) {
+        MESH_INFO("TCP fallback: filtering interfaces by NCCL_SOCKET_IFNAME=%s", socket_ifname);
+    }
+
     // In TCP mode, we still need network interfaces for communication
     // Re-scan interfaces to populate NIC list with TCP-capable interfaces
     struct ifaddrs *ifaddr, *ifa;
@@ -1551,6 +1557,15 @@ int mesh_tcp_init(void) {
         if (ifa->ifa_addr->sa_family != AF_INET) continue;
         if (ifa->ifa_flags & IFF_LOOPBACK) continue;  // Skip loopback
         if (!(ifa->ifa_flags & IFF_UP)) continue;      // Skip down interfaces
+
+        // TICKET-E: Filter by NCCL_SOCKET_IFNAME if set
+        // Supports prefix matching (e.g., "enP" matches "enP7s7")
+        if (socket_ifname && socket_ifname[0]) {
+            size_t prefix_len = strlen(socket_ifname);
+            if (strncmp(ifa->ifa_name, socket_ifname, prefix_len) != 0) {
+                continue;
+            }
+        }
 
         struct mesh_nic *nic = &g_mesh_state.nics[g_mesh_state.num_nics];
         memset(nic, 0, sizeof(*nic));
@@ -1575,7 +1590,9 @@ int mesh_tcp_init(void) {
     freeifaddrs(ifaddr);
 
     if (g_mesh_state.num_nics == 0) {
-        MESH_WARN("No network interfaces found for TCP fallback");
+        MESH_WARN("No network interfaces found for TCP fallback%s%s",
+                  socket_ifname ? " (NCCL_SOCKET_IFNAME=" : "",
+                  socket_ifname ? socket_ifname : "");
         return -1;
     }
 
@@ -1716,9 +1733,10 @@ static ncclResult_t mesh_tcp_connect_impl(int dev, void *opaqueHandle, void **se
         return ncclSystemError;
     }
 
-    // Set TCP_NODELAY for low latency
+    // TICKET-E: Set TCP_NODELAY for low latency and SO_KEEPALIVE for dead peer detection
     int opt = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -1731,14 +1749,27 @@ static ncclResult_t mesh_tcp_connect_impl(int dev, void *opaqueHandle, void **se
     int retries = g_mesh_state.retry_count;
     int retry_delay_ms = 100;
 
+    // TICKET-E: Retry on transient TCP failures (connection refused, timeout, reset)
     while (retries > 0 && !connected) {
         if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
             connected = 1;
-        } else if (errno == ECONNREFUSED || errno == ETIMEDOUT) {
+        } else if (errno == ECONNREFUSED || errno == ETIMEDOUT ||
+                   errno == ECONNRESET || errno == ENETUNREACH ||
+                   errno == EHOSTUNREACH) {
             retries--;
             if (retries > 0) {
+                MESH_DEBUG("TCP connect: retrying in %dms (errno=%d: %s, %d retries left)",
+                           retry_delay_ms, errno, strerror(errno), retries);
                 usleep(retry_delay_ms * 1000);
                 retry_delay_ms *= 2;
+                // Recreate socket for retry since connect() on a failed socket
+                // may not work on all platforms
+                close(sock);
+                sock = socket(AF_INET, SOCK_STREAM, 0);
+                if (sock < 0) break;
+                int reopt = 1;
+                setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &reopt, sizeof(reopt));
+                setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &reopt, sizeof(reopt));
             }
         } else {
             break;
@@ -1814,9 +1845,10 @@ static ncclResult_t mesh_tcp_accept_impl(void *listenComm, void **recvComm,
         return ncclSystemError;
     }
 
-    // Set TCP_NODELAY
+    // TICKET-E: Set TCP_NODELAY and SO_KEEPALIVE for dead peer detection
     int opt = 1;
     setsockopt(conn_sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    setsockopt(conn_sock, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
 
     comm->sock = conn_sock;
     comm->remote_ip = ntohl(addr.sin_addr.s_addr);
@@ -2352,7 +2384,19 @@ static ncclResult_t mesh_tcp_closeSend(void *sendComm) {
     struct mesh_tcp_send_comm *comm = (struct mesh_tcp_send_comm *)sendComm;
 
     if (comm) {
+        // TICKET-E: Drain pending send queue to prevent memory leaks
+        struct mesh_tcp_request *req = comm->send_queue_head;
+        while (req) {
+            struct mesh_tcp_request *next = req->next;
+            __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+            free(req);
+            req = next;
+        }
+        comm->send_queue_head = NULL;
+        comm->send_queue_tail = NULL;
+
         if (comm->sock >= 0) {
+            shutdown(comm->sock, SHUT_RDWR);
             close(comm->sock);
         }
         free(comm);
@@ -2368,7 +2412,19 @@ static ncclResult_t mesh_tcp_closeRecv(void *recvComm) {
     struct mesh_tcp_recv_comm *comm = (struct mesh_tcp_recv_comm *)recvComm;
 
     if (comm) {
+        // TICKET-E: Drain pending recv queue to prevent memory leaks
+        struct mesh_tcp_request *req = comm->recv_queue_head;
+        while (req) {
+            struct mesh_tcp_request *next = req->next;
+            __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+            free(req);
+            req = next;
+        }
+        comm->recv_queue_head = NULL;
+        comm->recv_queue_tail = NULL;
+
         if (comm->sock >= 0) {
+            shutdown(comm->sock, SHUT_RDWR);
             close(comm->sock);
         }
         free(comm);
