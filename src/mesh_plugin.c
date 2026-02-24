@@ -378,6 +378,36 @@ int mesh_setup_nic(struct mesh_nic *nic, struct ibv_device *device) {
         return -1;
     }
     
+    /*
+     * TICKET-D: Discover PCI path for GPU-NIC affinity
+     *
+     * NCCL uses pciPath to determine which NIC is closest to which GPU. On
+     * standard x86 PCIe topologies, readlink on the sysfs device symlink
+     * yields a path like /sys/devices/pci0000:00/0000:00:1f.0/...
+     *
+     * On Grace Blackwell, the GPU connects to Grace CPU via NVLink-C2C (not
+     * PCIe), so the PCI path may not establish a traditional GPU-NIC affinity.
+     * If we can't determine the PCI path, we leave it empty. NCCL treats an
+     * empty pciPath as "unknown topology" and will use any available NIC,
+     * which is the correct fallback.
+     */
+    {
+        char sysfs_path[256];
+        char resolved[PATH_MAX];
+        snprintf(sysfs_path, sizeof(sysfs_path),
+                 "/sys/class/infiniband/%s/device", nic->dev_name);
+        char *real = realpath(sysfs_path, resolved);
+        if (real) {
+            strncpy(nic->pci_path, real, sizeof(nic->pci_path) - 1);
+            MESH_DEBUG("NIC %s: PCI path %s", nic->dev_name, nic->pci_path);
+        } else {
+            MESH_WARN("NIC %s: could not resolve PCI path (%s) - "
+                      "GPU-NIC affinity will be unavailable (OK for NVLink-C2C topologies)",
+                      nic->dev_name, strerror(errno));
+            nic->pci_path[0] = '\0';
+        }
+    }
+
     // Auto-discover GID index with IPv4-mapped address for RoCE compatibility
     // This is critical for 4-node line topology where different nodes may have
     // different GID table layouts (some with IPv4-mapped at index 3, others elsewhere)
@@ -2500,9 +2530,11 @@ static ncclResult_t mesh_getProperties(int dev, ncclNetProperties_v8_t *props) {
     
     memset(props, 0, sizeof(*props));
     props->name = nic->dev_name;
-    props->pciPath = nic->pci_path;
-    props->guid = 0;  // TODO: Get actual GUID
-    props->ptrSupport = NCCL_PTR_HOST;  // Only host memory for now (no GPUDirect RDMA)
+    /* TICKET-D: pciPath may be empty on Grace Blackwell (NVLink-C2C topology).
+     * NCCL treats NULL/empty pciPath as "use any NIC" which is correct. */
+    props->pciPath = nic->pci_path[0] ? nic->pci_path : NULL;
+    props->guid = 0;
+    props->ptrSupport = NCCL_PTR_HOST;
     // Use actual link speed if available, otherwise default to 100 Gbps
     props->speed = (nic->link_speed_mbps > 0) ? nic->link_speed_mbps : 100000;
     props->port = nic->port_num;
@@ -3541,12 +3573,15 @@ static ncclResult_t mesh_getProperties_v9(int dev, ncclNetProperties_v9_t *props
     strncpy(g_v9_pcipath_storage, nic->pci_path, sizeof(g_v9_pcipath_storage) - 1);
 
     props->name = g_v9_name_storage;
-    props->pciPath = g_v9_pcipath_storage;
+    /* TICKET-D: pciPath may be empty on Grace Blackwell (NVLink-C2C topology).
+     * NCCL treats NULL pciPath as "use any NIC" which is correct. */
+    props->pciPath = g_v9_pcipath_storage[0] ? g_v9_pcipath_storage : NULL;
     props->guid = 0;
     props->ptrSupport = NCCL_PTR_HOST;
     props->regIsGlobal = 0;
     props->forceFlush = 0;
-    props->speed = 100000;  /* 100 Gbps */
+    /* Use actual link speed if available */
+    props->speed = (nic->link_speed_mbps > 0) ? nic->link_speed_mbps : 100000;
     props->port = nic->port_num;
     props->latency = 1.0f;
     props->maxComms = nic->max_qp;
