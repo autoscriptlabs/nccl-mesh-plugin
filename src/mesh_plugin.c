@@ -3395,6 +3395,24 @@ static ncclResult_t mesh_closeListen(void *listenComm) {
     return ncclSuccess;
 }
 
+/*
+ * ============================================================================
+ * v9 API Stubs and Wrappers
+ *
+ * NCCL 2.29.2+ (v9 net plugin API) requires these additional functions beyond
+ * the v8 interface. They are called by NCCL core even if the plugin doesn't
+ * use device-side MR handles, irecv consumed notifications, or virtual devices.
+ * ============================================================================
+ */
+
+/*
+ * getDeviceMr - Return a device-side memory handle for registered memory.
+ *
+ * NCCL calls this to get a GPU-accessible handle for RDMA memory registrations
+ * (used with NCCL_NET_DEVICE_UNPACK). We don't support device-side MR handles,
+ * so we return NULL. NCCL treats NULL as "no device handle available" and falls
+ * back to host-side memory registration, which is correct for our use case.
+ */
 static ncclResult_t mesh_getDeviceMr(void *comm, void *mhandle, void **dptr_mhandle) {
     (void)comm;
     (void)mhandle;
@@ -3402,18 +3420,20 @@ static ncclResult_t mesh_getDeviceMr(void *comm, void *mhandle, void **dptr_mhan
     return ncclSuccess;
 }
 
+/*
+ * irecvConsumed - Notify the plugin that a received buffer has been consumed.
+ *
+ * NCCL calls this after it has finished processing data from an irecv buffer,
+ * allowing the plugin to reclaim or reuse the buffer. Since we use simple
+ * one-shot RDMA sends and TCP transfers (no ring buffer or credit-based flow
+ * control), this is a no-op.
+ */
 static ncclResult_t mesh_irecvConsumed(void *recvComm, int n, void *request) {
     (void)recvComm;
     (void)n;
     (void)request;
     return ncclSuccess;
 }
-
-/*
- * ============================================================================
- * v9 API Wrappers
- * ============================================================================
- */
 
 /* Static string storage for v9 properties (name and pciPath become pointers) */
 static char g_v9_name_storage[256];
@@ -3479,8 +3499,15 @@ static ncclResult_t mesh_irecv_v9(void *recvComm, int n, void **data, size_t *si
     return ret;
 }
 
+/*
+ * makeVDevice - Create a virtual device from a set of physical devices.
+ *
+ * NCCL v9 can aggregate multiple physical NICs into a single virtual device
+ * for higher bandwidth. We don't support virtual devices, so we return
+ * ncclInternalError to indicate the feature is unavailable. NCCL will fall
+ * back to using physical devices individually.
+ */
 static ncclResult_t mesh_makeVDevice(int *d, ncclNetVDeviceProps_v9_t *props) {
-    /* Virtual device not supported */
     (void)d;
     (void)props;
     return ncclInternalError;
