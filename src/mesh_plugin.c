@@ -712,10 +712,10 @@ static void *handshake_thread_func(void *arg) {
     int flags = fcntl(lcomm->handshake_sock, F_GETFL, 0);
     fcntl(lcomm->handshake_sock, F_SETFL, flags | O_NONBLOCK);
     
-    while (!lcomm->thread_stop) {
+    while (!__atomic_load_n(&lcomm->thread_stop, __ATOMIC_ACQUIRE)) {
         struct sockaddr_in addr;
         socklen_t addrlen = sizeof(addr);
-        
+
         int conn_sock = accept(lcomm->handshake_sock, (struct sockaddr *)&addr, &addrlen);
         if (conn_sock < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -1213,24 +1213,26 @@ static void *async_connect_thread_func(void *arg) {
 
     MESH_DEBUG("Async connect thread started");
 
-    while (!state->thread_stop) {
+    while (!__atomic_load_n(&state->thread_stop, __ATOMIC_ACQUIRE)) {
         struct mesh_async_connect_req *req = NULL;
 
         pthread_mutex_lock(&state->mutex);
 
         // Wait for work
-        while (state->queue_head == state->queue_tail && !state->thread_stop) {
+        while (state->queue_head == state->queue_tail &&
+               !__atomic_load_n(&state->thread_stop, __ATOMIC_ACQUIRE)) {
             pthread_cond_wait(&state->cond, &state->mutex);
         }
 
-        if (state->thread_stop) {
+        if (__atomic_load_n(&state->thread_stop, __ATOMIC_ACQUIRE)) {
             pthread_mutex_unlock(&state->mutex);
             break;
         }
 
         // Get next request
         req = &state->queue[state->queue_head];
-        if (req->valid && !req->complete) {
+        if (__atomic_load_n(&req->valid, __ATOMIC_ACQUIRE) &&
+            !__atomic_load_n(&req->complete, __ATOMIC_ACQUIRE)) {
             pthread_mutex_unlock(&state->mutex);
 
             // Perform the connection (outside lock)
@@ -1240,8 +1242,8 @@ static void *async_connect_thread_func(void *arg) {
 
             // Create QP
             if (mesh_create_qp(req->nic, &req->qp, &req->cq) != 0) {
-                req->error = 1;
-                req->complete = 1;
+                __atomic_store_n(&req->error, 1, __ATOMIC_RELEASE);
+                __atomic_store_n(&req->complete, 1, __ATOMIC_RELEASE);
                 MESH_WARN("Async connect: failed to create QP for %s", ip_str);
                 continue;
             }
@@ -1263,8 +1265,8 @@ static void *async_connect_thread_func(void *arg) {
             uint32_t handshake_ip = ntohl(req->selected_addr->ip);
             if (mesh_send_handshake(handshake_ip, req->handle.handshake_port,
                                     &local_info, &remote_info) != 0) {
-                req->error = 1;
-                req->complete = 1;
+                __atomic_store_n(&req->error, 1, __ATOMIC_RELEASE);
+                __atomic_store_n(&req->complete, 1, __ATOMIC_RELEASE);
                 ibv_destroy_qp(req->qp);
                 ibv_destroy_cq(req->cq);
                 req->qp = NULL;
@@ -1293,8 +1295,8 @@ static void *async_connect_thread_func(void *arg) {
             connect_handle.gid = peer_gid;
 
             if (mesh_connect_qp(req->qp, req->nic, &connect_handle) != 0) {
-                req->error = 1;
-                req->complete = 1;
+                __atomic_store_n(&req->error, 1, __ATOMIC_RELEASE);
+                __atomic_store_n(&req->complete, 1, __ATOMIC_RELEASE);
                 ibv_destroy_qp(req->qp);
                 ibv_destroy_cq(req->cq);
                 req->qp = NULL;
@@ -1304,8 +1306,8 @@ static void *async_connect_thread_func(void *arg) {
             }
 
             req->remote_qp_num = connect_handle.qp_num;
-            req->complete = 1;
-            req->error = 0;
+            __atomic_store_n(&req->error, 0, __ATOMIC_RELEASE);
+            __atomic_store_n(&req->complete, 1, __ATOMIC_RELEASE);
 
             MESH_DEBUG("Async connect: completed for %s (QP %d -> %d)",
                        ip_str, req->qp->qp_num, req->remote_qp_num);
@@ -1337,7 +1339,7 @@ int mesh_async_connect_init(void) {
         return -1;
     }
 
-    state->thread_running = 1;
+    __atomic_store_n(&state->thread_running, 1, __ATOMIC_RELEASE);
     MESH_INFO("Async connect thread initialized");
     return 0;
 }
@@ -1348,23 +1350,23 @@ int mesh_async_connect_init(void) {
 void mesh_async_connect_destroy(void) {
     struct mesh_async_connect_state *state = &g_mesh_state.async_connect;
 
-    if (state->thread_running) {
+    if (__atomic_load_n(&state->thread_running, __ATOMIC_ACQUIRE)) {
         pthread_mutex_lock(&state->mutex);
-        state->thread_stop = 1;
+        __atomic_store_n(&state->thread_stop, 1, __ATOMIC_RELEASE);
         pthread_cond_broadcast(&state->cond);
         pthread_mutex_unlock(&state->mutex);
 
         pthread_join(state->thread, NULL);
-        state->thread_running = 0;
+        __atomic_store_n(&state->thread_running, 0, __ATOMIC_RELEASE);
     }
 
     // Clean up any pending requests
     for (int i = 0; i < MESH_ASYNC_QUEUE_SIZE; i++) {
         struct mesh_async_connect_req *req = &state->queue[i];
-        if (req->valid && req->qp) {
+        if (__atomic_load_n(&req->valid, __ATOMIC_ACQUIRE) && req->qp) {
             ibv_destroy_qp(req->qp);
         }
-        if (req->valid && req->cq) {
+        if (__atomic_load_n(&req->valid, __ATOMIC_ACQUIRE) && req->cq) {
             ibv_destroy_cq(req->cq);
         }
     }
@@ -1394,14 +1396,15 @@ struct mesh_async_connect_req* mesh_async_connect_submit(struct mesh_handle *han
         req = &state->queue[state->queue_tail];
 
         memset(req, 0, sizeof(*req));
-        req->valid = 1;
-        req->complete = 0;
-        req->error = 0;
+        __atomic_store_n(&req->complete, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&req->error, 0, __ATOMIC_RELAXED);
         memcpy(&req->handle, handle, sizeof(*handle));
         req->nic = nic;
         req->selected_addr = addr;
         req->peer_ip = ntohl(addr->ip);
         req->send_comm = send_comm;
+        /* Set valid last with release to ensure all fields above are visible */
+        __atomic_store_n(&req->valid, 1, __ATOMIC_RELEASE);
 
         state->queue_tail = next_tail;
         pthread_cond_signal(&state->cond);
@@ -1423,7 +1426,7 @@ struct mesh_async_connect_req* mesh_async_connect_submit(struct mesh_handle *han
  */
 int mesh_async_connect_poll(struct mesh_async_connect_req *req) {
     if (!req) return 1;
-    return req->complete;
+    return __atomic_load_n(&req->complete, __ATOMIC_ACQUIRE);
 }
 
 /*
@@ -1778,7 +1781,7 @@ static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag
         return ncclSystemError;
     }
 
-    if (comm->peer_failed) {
+    if (__atomic_load_n(&comm->peer_failed, __ATOMIC_ACQUIRE)) {
         MESH_WARN("TCP isend: Peer already failed");
         return ncclSystemError;
     }
@@ -1842,7 +1845,7 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
         return ncclSystemError;
     }
 
-    if (comm->peer_failed) {
+    if (__atomic_load_n(&comm->peer_failed, __ATOMIC_ACQUIRE)) {
         MESH_WARN("TCP irecv: Peer already failed");
         return ncclSystemError;
     }
@@ -2137,7 +2140,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                     return ncclSuccess;
                 }
                 MESH_WARN("TCP test: Failed to send header: %s", strerror(errno));
-                comm->peer_failed = 1;
+                __atomic_store_n(&comm->peer_failed, 1, __ATOMIC_RELEASE);
                 req->error = errno;
                 req->done = 1;
                 *done = 1;
@@ -2152,7 +2155,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
             }
             if (sent != sizeof(net_size)) {
                 MESH_WARN("TCP test: Partial header send");
-                comm->peer_failed = 1;
+                __atomic_store_n(&comm->peer_failed, 1, __ATOMIC_RELEASE);
                 req->error = EPROTO;
                 req->done = 1;
                 *done = 1;
@@ -2188,7 +2191,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                     break;
                 }
                 MESH_WARN("TCP test: Failed to send data: %s", strerror(errno));
-                comm->peer_failed = 1;
+                __atomic_store_n(&comm->peer_failed, 1, __ATOMIC_RELEASE);
                 req->error = errno;
                 req->done = 1;
                 *done = 1;
@@ -2515,13 +2518,13 @@ static ncclResult_t mesh_listen(int dev, void *handle, void **listenComm) {
     pthread_cond_init(&comm->queue_cond, NULL);
     comm->queue_head = 0;
     comm->queue_tail = 0;
-    comm->thread_stop = 0;
-    comm->thread_running = 0;
-    
+    __atomic_store_n(&comm->thread_stop, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&comm->thread_running, 0, __ATOMIC_RELAXED);
+
     // Start handshake thread
     if (comm->handshake_sock >= 0) {
         if (pthread_create(&comm->handshake_thread, NULL, handshake_thread_func, comm) == 0) {
-            comm->thread_running = 1;
+            __atomic_store_n(&comm->thread_running, 1, __ATOMIC_RELEASE);
         } else {
             MESH_WARN("Failed to start handshake thread");
         }
@@ -2948,7 +2951,7 @@ static ncclResult_t mesh_isend(void *sendComm, void *data, int size, int tag,
     }
 
     // Fast-fail if peer already known to be disconnected
-    if (comm->peer_failed) {
+    if (__atomic_load_n(&comm->peer_failed, __ATOMIC_ACQUIRE)) {
         MESH_WARN("isend: peer already failed (last_status=%d), failing fast",
                   comm->last_wc_status);
         return ncclSystemError;
@@ -3034,7 +3037,7 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
     }
 
     // Fast-fail if peer already known to be disconnected
-    if (comm->peer_failed) {
+    if (__atomic_load_n(&comm->peer_failed, __ATOMIC_ACQUIRE)) {
         MESH_WARN("irecv: peer already failed (last_status=%d), failing fast",
                   comm->last_wc_status);
         return ncclSystemError;
@@ -3123,22 +3126,22 @@ static void mesh_mark_peer_failed(struct mesh_request *req, enum ibv_wc_status s
 
     if (req->is_send) {
         struct mesh_send_comm *comm = (struct mesh_send_comm *)req->comm;
-        if (!comm->peer_failed) {
-            comm->peer_failed = 1;
+        if (!__atomic_load_n(&comm->peer_failed, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&comm->peer_failed, 1, __ATOMIC_RELEASE);
             comm->last_wc_status = status;
             MESH_WARN("Peer failure detected on send comm: status=%d (%s)",
                       status, ibv_wc_status_str(status));
         }
-        comm->error_count++;
+        __atomic_fetch_add(&comm->error_count, 1, __ATOMIC_RELAXED);
     } else {
         struct mesh_recv_comm *comm = (struct mesh_recv_comm *)req->comm;
-        if (!comm->peer_failed) {
-            comm->peer_failed = 1;
+        if (!__atomic_load_n(&comm->peer_failed, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&comm->peer_failed, 1, __ATOMIC_RELEASE);
             comm->last_wc_status = status;
             MESH_WARN("Peer failure detected on recv comm: status=%d (%s)",
                       status, ibv_wc_status_str(status));
         }
-        comm->error_count++;
+        __atomic_fetch_add(&comm->error_count, 1, __ATOMIC_RELAXED);
     }
 }
 
@@ -3183,7 +3186,7 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
         return ncclSuccess;
     }
 
-    if (req->done) {
+    if (__atomic_load_n(&req->done, __ATOMIC_ACQUIRE)) {
         *done = 1;
         if (sizes) *sizes = req->size;
         mesh_untrack_request(req);  // TICKET-9: Remove from comm tracking
@@ -3195,7 +3198,7 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
 
     if (!req->cq) {
         MESH_WARN("mesh_test: request has no CQ");
-        req->done = 1;
+        __atomic_store_n(&req->done, 1, __ATOMIC_RELEASE);
         *done = 1;
         mesh_untrack_request(req);  // TICKET-9: Remove from comm tracking
         __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
@@ -3234,8 +3237,8 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
 
             // Mark the request as done (with error)
             if (completed_req) {
-                completed_req->done = 1;
                 completed_req->wc = wc;
+                __atomic_store_n(&completed_req->done, 1, __ATOMIC_RELEASE);
             }
 
             // If this is our request, return error immediately
@@ -3254,8 +3257,8 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
 
         // Success - mark the request as done
         if (completed_req) {
-            completed_req->done = 1;
             completed_req->wc = wc;
+            __atomic_store_n(&completed_req->done, 1, __ATOMIC_RELEASE);
         }
 
         // Is it OUR request?
@@ -3295,7 +3298,7 @@ static ncclResult_t mesh_closeSend(void *sendComm) {
         // before all operations complete (e.g., FSDP timeout during all-gather)
         for (int i = 0; i < comm->num_requests; i++) {
             struct mesh_request *req = comm->requests[i];
-            if (req && !req->done) {
+            if (req && !__atomic_load_n(&req->done, __ATOMIC_ACQUIRE)) {
                 MESH_DEBUG("closeSend: freeing outstanding request %d", i);
                 __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
                 free(req);
@@ -3332,7 +3335,7 @@ static ncclResult_t mesh_closeRecv(void *recvComm) {
         // before all operations complete (e.g., FSDP timeout during all-gather)
         for (int i = 0; i < comm->num_requests; i++) {
             struct mesh_request *req = comm->requests[i];
-            if (req && !req->done) {
+            if (req && !__atomic_load_n(&req->done, __ATOMIC_ACQUIRE)) {
                 MESH_DEBUG("closeRecv: freeing outstanding request %d", i);
                 __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
                 free(req);
@@ -3359,11 +3362,11 @@ static ncclResult_t mesh_closeListen(void *listenComm) {
 
     if (comm) {
         // Stop handshake thread
-        if (comm->thread_running) {
-            comm->thread_stop = 1;
+        if (__atomic_load_n(&comm->thread_running, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&comm->thread_stop, 1, __ATOMIC_RELEASE);
             pthread_cond_broadcast(&comm->queue_cond);
             pthread_join(comm->handshake_thread, NULL);
-            comm->thread_running = 0;
+            __atomic_store_n(&comm->thread_running, 0, __ATOMIC_RELEASE);
         }
         
         // Close handshake socket
