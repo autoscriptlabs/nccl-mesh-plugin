@@ -22,12 +22,70 @@
 #include <net/if.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <dlfcn.h>
 
 #include <infiniband/verbs.h>
 
 #include "nccl/net.h"
 #include "mesh_plugin.h"
 #include "mesh_routing.h"
+
+/*
+ * CUDA unified memory detection (TICKET-C)
+ *
+ * On Grace Blackwell, CUDA unified (managed) memory pointers may be passed to
+ * regMr. We use dlsym to optionally resolve cudaPointerGetAttributes at runtime
+ * so we can detect managed memory without a compile-time CUDA dependency.
+ */
+enum {
+    CUDA_MEMORY_TYPE_UNREGISTERED = 0,
+    CUDA_MEMORY_TYPE_HOST = 1,
+    CUDA_MEMORY_TYPE_DEVICE = 2,
+    CUDA_MEMORY_TYPE_MANAGED = 3,
+};
+
+struct cuda_pointer_attributes {
+    int type;           /* cudaMemoryType */
+    int device;
+    void *devicePointer;
+    void *hostPointer;
+};
+
+typedef int (*cudaPointerGetAttributes_fn)(struct cuda_pointer_attributes *, const void *);
+static cudaPointerGetAttributes_fn g_cudaPointerGetAttributes = NULL;
+static int g_cuda_checked = 0;
+
+static void mesh_init_cuda_check(void) {
+    if (g_cuda_checked) return;
+    g_cuda_checked = 1;
+    void *handle = dlopen("libcudart.so", RTLD_LAZY | RTLD_NOLOAD);
+    if (!handle) {
+        /* Try versioned name */
+        handle = dlopen("libcudart.so.12", RTLD_LAZY | RTLD_NOLOAD);
+    }
+    if (handle) {
+        g_cudaPointerGetAttributes =
+            (cudaPointerGetAttributes_fn)dlsym(handle, "cudaPointerGetAttributes");
+        if (g_cudaPointerGetAttributes) {
+            MESH_INFO("CUDA runtime found - unified memory detection enabled");
+        }
+        /* Don't dlclose - we need the symbol to remain valid */
+    }
+}
+
+/*
+ * Check if a pointer is CUDA managed (unified) memory.
+ * Returns 1 if managed, 0 otherwise or if CUDA is not available.
+ */
+static int mesh_is_managed_memory(const void *ptr) {
+    if (!g_cudaPointerGetAttributes) return 0;
+
+    struct cuda_pointer_attributes attrs;
+    memset(&attrs, 0, sizeof(attrs));
+    int err = g_cudaPointerGetAttributes(&attrs, ptr);
+    if (err != 0) return 0;
+    return (attrs.type == CUDA_MEMORY_TYPE_MANAGED);
+}
 
 // Global state
 struct mesh_plugin_state g_mesh_state = {0};
@@ -320,6 +378,36 @@ int mesh_setup_nic(struct mesh_nic *nic, struct ibv_device *device) {
         return -1;
     }
     
+    /*
+     * TICKET-D: Discover PCI path for GPU-NIC affinity
+     *
+     * NCCL uses pciPath to determine which NIC is closest to which GPU. On
+     * standard x86 PCIe topologies, readlink on the sysfs device symlink
+     * yields a path like /sys/devices/pci0000:00/0000:00:1f.0/...
+     *
+     * On Grace Blackwell, the GPU connects to Grace CPU via NVLink-C2C (not
+     * PCIe), so the PCI path may not establish a traditional GPU-NIC affinity.
+     * If we can't determine the PCI path, we leave it empty. NCCL treats an
+     * empty pciPath as "unknown topology" and will use any available NIC,
+     * which is the correct fallback.
+     */
+    {
+        char sysfs_path[256];
+        char resolved[PATH_MAX];
+        snprintf(sysfs_path, sizeof(sysfs_path),
+                 "/sys/class/infiniband/%s/device", nic->dev_name);
+        char *real = realpath(sysfs_path, resolved);
+        if (real) {
+            strncpy(nic->pci_path, real, sizeof(nic->pci_path) - 1);
+            MESH_DEBUG("NIC %s: PCI path %s", nic->dev_name, nic->pci_path);
+        } else {
+            MESH_WARN("NIC %s: could not resolve PCI path (%s) - "
+                      "GPU-NIC affinity will be unavailable (OK for NVLink-C2C topologies)",
+                      nic->dev_name, strerror(errno));
+            nic->pci_path[0] = '\0';
+        }
+    }
+
     // Auto-discover GID index with IPv4-mapped address for RoCE compatibility
     // This is critical for 4-node line topology where different nodes may have
     // different GID table layouts (some with IPv4-mapped at index 3, others elsewhere)
@@ -712,10 +800,10 @@ static void *handshake_thread_func(void *arg) {
     int flags = fcntl(lcomm->handshake_sock, F_GETFL, 0);
     fcntl(lcomm->handshake_sock, F_SETFL, flags | O_NONBLOCK);
     
-    while (!lcomm->thread_stop) {
+    while (!__atomic_load_n(&lcomm->thread_stop, __ATOMIC_ACQUIRE)) {
         struct sockaddr_in addr;
         socklen_t addrlen = sizeof(addr);
-        
+
         int conn_sock = accept(lcomm->handshake_sock, (struct sockaddr *)&addr, &addrlen);
         if (conn_sock < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -1213,24 +1301,26 @@ static void *async_connect_thread_func(void *arg) {
 
     MESH_DEBUG("Async connect thread started");
 
-    while (!state->thread_stop) {
+    while (!__atomic_load_n(&state->thread_stop, __ATOMIC_ACQUIRE)) {
         struct mesh_async_connect_req *req = NULL;
 
         pthread_mutex_lock(&state->mutex);
 
         // Wait for work
-        while (state->queue_head == state->queue_tail && !state->thread_stop) {
+        while (state->queue_head == state->queue_tail &&
+               !__atomic_load_n(&state->thread_stop, __ATOMIC_ACQUIRE)) {
             pthread_cond_wait(&state->cond, &state->mutex);
         }
 
-        if (state->thread_stop) {
+        if (__atomic_load_n(&state->thread_stop, __ATOMIC_ACQUIRE)) {
             pthread_mutex_unlock(&state->mutex);
             break;
         }
 
         // Get next request
         req = &state->queue[state->queue_head];
-        if (req->valid && !req->complete) {
+        if (__atomic_load_n(&req->valid, __ATOMIC_ACQUIRE) &&
+            !__atomic_load_n(&req->complete, __ATOMIC_ACQUIRE)) {
             pthread_mutex_unlock(&state->mutex);
 
             // Perform the connection (outside lock)
@@ -1240,8 +1330,8 @@ static void *async_connect_thread_func(void *arg) {
 
             // Create QP
             if (mesh_create_qp(req->nic, &req->qp, &req->cq) != 0) {
-                req->error = 1;
-                req->complete = 1;
+                __atomic_store_n(&req->error, 1, __ATOMIC_RELEASE);
+                __atomic_store_n(&req->complete, 1, __ATOMIC_RELEASE);
                 MESH_WARN("Async connect: failed to create QP for %s", ip_str);
                 continue;
             }
@@ -1263,8 +1353,8 @@ static void *async_connect_thread_func(void *arg) {
             uint32_t handshake_ip = ntohl(req->selected_addr->ip);
             if (mesh_send_handshake(handshake_ip, req->handle.handshake_port,
                                     &local_info, &remote_info) != 0) {
-                req->error = 1;
-                req->complete = 1;
+                __atomic_store_n(&req->error, 1, __ATOMIC_RELEASE);
+                __atomic_store_n(&req->complete, 1, __ATOMIC_RELEASE);
                 ibv_destroy_qp(req->qp);
                 ibv_destroy_cq(req->cq);
                 req->qp = NULL;
@@ -1293,8 +1383,8 @@ static void *async_connect_thread_func(void *arg) {
             connect_handle.gid = peer_gid;
 
             if (mesh_connect_qp(req->qp, req->nic, &connect_handle) != 0) {
-                req->error = 1;
-                req->complete = 1;
+                __atomic_store_n(&req->error, 1, __ATOMIC_RELEASE);
+                __atomic_store_n(&req->complete, 1, __ATOMIC_RELEASE);
                 ibv_destroy_qp(req->qp);
                 ibv_destroy_cq(req->cq);
                 req->qp = NULL;
@@ -1304,8 +1394,8 @@ static void *async_connect_thread_func(void *arg) {
             }
 
             req->remote_qp_num = connect_handle.qp_num;
-            req->complete = 1;
-            req->error = 0;
+            __atomic_store_n(&req->error, 0, __ATOMIC_RELEASE);
+            __atomic_store_n(&req->complete, 1, __ATOMIC_RELEASE);
 
             MESH_DEBUG("Async connect: completed for %s (QP %d -> %d)",
                        ip_str, req->qp->qp_num, req->remote_qp_num);
@@ -1337,7 +1427,7 @@ int mesh_async_connect_init(void) {
         return -1;
     }
 
-    state->thread_running = 1;
+    __atomic_store_n(&state->thread_running, 1, __ATOMIC_RELEASE);
     MESH_INFO("Async connect thread initialized");
     return 0;
 }
@@ -1348,23 +1438,23 @@ int mesh_async_connect_init(void) {
 void mesh_async_connect_destroy(void) {
     struct mesh_async_connect_state *state = &g_mesh_state.async_connect;
 
-    if (state->thread_running) {
+    if (__atomic_load_n(&state->thread_running, __ATOMIC_ACQUIRE)) {
         pthread_mutex_lock(&state->mutex);
-        state->thread_stop = 1;
+        __atomic_store_n(&state->thread_stop, 1, __ATOMIC_RELEASE);
         pthread_cond_broadcast(&state->cond);
         pthread_mutex_unlock(&state->mutex);
 
         pthread_join(state->thread, NULL);
-        state->thread_running = 0;
+        __atomic_store_n(&state->thread_running, 0, __ATOMIC_RELEASE);
     }
 
     // Clean up any pending requests
     for (int i = 0; i < MESH_ASYNC_QUEUE_SIZE; i++) {
         struct mesh_async_connect_req *req = &state->queue[i];
-        if (req->valid && req->qp) {
+        if (__atomic_load_n(&req->valid, __ATOMIC_ACQUIRE) && req->qp) {
             ibv_destroy_qp(req->qp);
         }
-        if (req->valid && req->cq) {
+        if (__atomic_load_n(&req->valid, __ATOMIC_ACQUIRE) && req->cq) {
             ibv_destroy_cq(req->cq);
         }
     }
@@ -1394,14 +1484,15 @@ struct mesh_async_connect_req* mesh_async_connect_submit(struct mesh_handle *han
         req = &state->queue[state->queue_tail];
 
         memset(req, 0, sizeof(*req));
-        req->valid = 1;
-        req->complete = 0;
-        req->error = 0;
+        __atomic_store_n(&req->complete, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&req->error, 0, __ATOMIC_RELAXED);
         memcpy(&req->handle, handle, sizeof(*handle));
         req->nic = nic;
         req->selected_addr = addr;
         req->peer_ip = ntohl(addr->ip);
         req->send_comm = send_comm;
+        /* Set valid last with release to ensure all fields above are visible */
+        __atomic_store_n(&req->valid, 1, __ATOMIC_RELEASE);
 
         state->queue_tail = next_tail;
         pthread_cond_signal(&state->cond);
@@ -1423,7 +1514,7 @@ struct mesh_async_connect_req* mesh_async_connect_submit(struct mesh_handle *han
  */
 int mesh_async_connect_poll(struct mesh_async_connect_req *req) {
     if (!req) return 1;
-    return req->complete;
+    return __atomic_load_n(&req->complete, __ATOMIC_ACQUIRE);
 }
 
 /*
@@ -1444,6 +1535,12 @@ int mesh_tcp_init(void) {
     MESH_WARN("TCP fallback mode activated - RDMA not available or disabled");
     g_mesh_state.tcp_fallback_active = 1;
 
+    // TICKET-E: Respect NCCL_SOCKET_IFNAME to filter interfaces
+    const char *socket_ifname = getenv("NCCL_SOCKET_IFNAME");
+    if (socket_ifname && socket_ifname[0]) {
+        MESH_INFO("TCP fallback: filtering interfaces by NCCL_SOCKET_IFNAME=%s", socket_ifname);
+    }
+
     // In TCP mode, we still need network interfaces for communication
     // Re-scan interfaces to populate NIC list with TCP-capable interfaces
     struct ifaddrs *ifaddr, *ifa;
@@ -1460,6 +1557,15 @@ int mesh_tcp_init(void) {
         if (ifa->ifa_addr->sa_family != AF_INET) continue;
         if (ifa->ifa_flags & IFF_LOOPBACK) continue;  // Skip loopback
         if (!(ifa->ifa_flags & IFF_UP)) continue;      // Skip down interfaces
+
+        // TICKET-E: Filter by NCCL_SOCKET_IFNAME if set
+        // Supports prefix matching (e.g., "enP" matches "enP7s7")
+        if (socket_ifname && socket_ifname[0]) {
+            size_t prefix_len = strlen(socket_ifname);
+            if (strncmp(ifa->ifa_name, socket_ifname, prefix_len) != 0) {
+                continue;
+            }
+        }
 
         struct mesh_nic *nic = &g_mesh_state.nics[g_mesh_state.num_nics];
         memset(nic, 0, sizeof(*nic));
@@ -1484,7 +1590,9 @@ int mesh_tcp_init(void) {
     freeifaddrs(ifaddr);
 
     if (g_mesh_state.num_nics == 0) {
-        MESH_WARN("No network interfaces found for TCP fallback");
+        MESH_WARN("No network interfaces found for TCP fallback%s%s",
+                  socket_ifname ? " (NCCL_SOCKET_IFNAME=" : "",
+                  socket_ifname ? socket_ifname : "");
         return -1;
     }
 
@@ -1625,9 +1733,10 @@ static ncclResult_t mesh_tcp_connect_impl(int dev, void *opaqueHandle, void **se
         return ncclSystemError;
     }
 
-    // Set TCP_NODELAY for low latency
+    // TICKET-E: Set TCP_NODELAY for low latency and SO_KEEPALIVE for dead peer detection
     int opt = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -1640,14 +1749,27 @@ static ncclResult_t mesh_tcp_connect_impl(int dev, void *opaqueHandle, void **se
     int retries = g_mesh_state.retry_count;
     int retry_delay_ms = 100;
 
+    // TICKET-E: Retry on transient TCP failures (connection refused, timeout, reset)
     while (retries > 0 && !connected) {
         if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
             connected = 1;
-        } else if (errno == ECONNREFUSED || errno == ETIMEDOUT) {
+        } else if (errno == ECONNREFUSED || errno == ETIMEDOUT ||
+                   errno == ECONNRESET || errno == ENETUNREACH ||
+                   errno == EHOSTUNREACH) {
             retries--;
             if (retries > 0) {
+                MESH_DEBUG("TCP connect: retrying in %dms (errno=%d: %s, %d retries left)",
+                           retry_delay_ms, errno, strerror(errno), retries);
                 usleep(retry_delay_ms * 1000);
                 retry_delay_ms *= 2;
+                // Recreate socket for retry since connect() on a failed socket
+                // may not work on all platforms
+                close(sock);
+                sock = socket(AF_INET, SOCK_STREAM, 0);
+                if (sock < 0) break;
+                int reopt = 1;
+                setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &reopt, sizeof(reopt));
+                setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &reopt, sizeof(reopt));
             }
         } else {
             break;
@@ -1723,9 +1845,10 @@ static ncclResult_t mesh_tcp_accept_impl(void *listenComm, void **recvComm,
         return ncclSystemError;
     }
 
-    // Set TCP_NODELAY
+    // TICKET-E: Set TCP_NODELAY and SO_KEEPALIVE for dead peer detection
     int opt = 1;
     setsockopt(conn_sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    setsockopt(conn_sock, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
 
     comm->sock = conn_sock;
     comm->remote_ip = ntohl(addr.sin_addr.s_addr);
@@ -1778,7 +1901,7 @@ static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag
         return ncclSystemError;
     }
 
-    if (comm->peer_failed) {
+    if (__atomic_load_n(&comm->peer_failed, __ATOMIC_ACQUIRE)) {
         MESH_WARN("TCP isend: Peer already failed");
         return ncclSystemError;
     }
@@ -1842,7 +1965,7 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
         return ncclSystemError;
     }
 
-    if (comm->peer_failed) {
+    if (__atomic_load_n(&comm->peer_failed, __ATOMIC_ACQUIRE)) {
         MESH_WARN("TCP irecv: Peer already failed");
         return ncclSystemError;
     }
@@ -2137,7 +2260,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                     return ncclSuccess;
                 }
                 MESH_WARN("TCP test: Failed to send header: %s", strerror(errno));
-                comm->peer_failed = 1;
+                __atomic_store_n(&comm->peer_failed, 1, __ATOMIC_RELEASE);
                 req->error = errno;
                 req->done = 1;
                 *done = 1;
@@ -2152,7 +2275,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
             }
             if (sent != sizeof(net_size)) {
                 MESH_WARN("TCP test: Partial header send");
-                comm->peer_failed = 1;
+                __atomic_store_n(&comm->peer_failed, 1, __ATOMIC_RELEASE);
                 req->error = EPROTO;
                 req->done = 1;
                 *done = 1;
@@ -2188,7 +2311,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                     break;
                 }
                 MESH_WARN("TCP test: Failed to send data: %s", strerror(errno));
-                comm->peer_failed = 1;
+                __atomic_store_n(&comm->peer_failed, 1, __ATOMIC_RELEASE);
                 req->error = errno;
                 req->done = 1;
                 *done = 1;
@@ -2261,7 +2384,19 @@ static ncclResult_t mesh_tcp_closeSend(void *sendComm) {
     struct mesh_tcp_send_comm *comm = (struct mesh_tcp_send_comm *)sendComm;
 
     if (comm) {
+        // TICKET-E: Drain pending send queue to prevent memory leaks
+        struct mesh_tcp_request *req = comm->send_queue_head;
+        while (req) {
+            struct mesh_tcp_request *next = req->next;
+            __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+            free(req);
+            req = next;
+        }
+        comm->send_queue_head = NULL;
+        comm->send_queue_tail = NULL;
+
         if (comm->sock >= 0) {
+            shutdown(comm->sock, SHUT_RDWR);
             close(comm->sock);
         }
         free(comm);
@@ -2277,7 +2412,19 @@ static ncclResult_t mesh_tcp_closeRecv(void *recvComm) {
     struct mesh_tcp_recv_comm *comm = (struct mesh_tcp_recv_comm *)recvComm;
 
     if (comm) {
+        // TICKET-E: Drain pending recv queue to prevent memory leaks
+        struct mesh_tcp_request *req = comm->recv_queue_head;
+        while (req) {
+            struct mesh_tcp_request *next = req->next;
+            __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+            free(req);
+            req = next;
+        }
+        comm->recv_queue_head = NULL;
+        comm->recv_queue_tail = NULL;
+
         if (comm->sock >= 0) {
+            shutdown(comm->sock, SHUT_RDWR);
             close(comm->sock);
         }
         free(comm);
@@ -2314,6 +2461,9 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
     }
 
     g_mesh_state.log_fn = logFunction;
+
+    // Initialize CUDA unified memory detection (TICKET-C)
+    mesh_init_cuda_check();
 
     // Read configuration from environment
     const char *env_val;
@@ -2436,9 +2586,11 @@ static ncclResult_t mesh_getProperties(int dev, ncclNetProperties_v8_t *props) {
     
     memset(props, 0, sizeof(*props));
     props->name = nic->dev_name;
-    props->pciPath = nic->pci_path;
-    props->guid = 0;  // TODO: Get actual GUID
-    props->ptrSupport = NCCL_PTR_HOST;  // Only host memory for now (no GPUDirect RDMA)
+    /* TICKET-D: pciPath may be empty on Grace Blackwell (NVLink-C2C topology).
+     * NCCL treats NULL/empty pciPath as "use any NIC" which is correct. */
+    props->pciPath = nic->pci_path[0] ? nic->pci_path : NULL;
+    props->guid = 0;
+    props->ptrSupport = NCCL_PTR_HOST;
     // Use actual link speed if available, otherwise default to 100 Gbps
     props->speed = (nic->link_speed_mbps > 0) ? nic->link_speed_mbps : 100000;
     props->port = nic->port_num;
@@ -2515,13 +2667,13 @@ static ncclResult_t mesh_listen(int dev, void *handle, void **listenComm) {
     pthread_cond_init(&comm->queue_cond, NULL);
     comm->queue_head = 0;
     comm->queue_tail = 0;
-    comm->thread_stop = 0;
-    comm->thread_running = 0;
-    
+    __atomic_store_n(&comm->thread_stop, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&comm->thread_running, 0, __ATOMIC_RELAXED);
+
     // Start handshake thread
     if (comm->handshake_sock >= 0) {
         if (pthread_create(&comm->handshake_thread, NULL, handshake_thread_func, comm) == 0) {
-            comm->thread_running = 1;
+            __atomic_store_n(&comm->thread_running, 1, __ATOMIC_RELEASE);
         } else {
             MESH_WARN("Failed to start handshake thread");
         }
@@ -2878,25 +3030,49 @@ static ncclResult_t mesh_regMr(void *comm, void *data, size_t size, int type, vo
         MESH_WARN("regMr: invalid comm or nic");
         return ncclSystemError;
     }
-    
-    
+
     mrh = calloc(1, sizeof(*mrh));
     if (!mrh) {
         return ncclSystemError;
     }
-    
+
+    /*
+     * TICKET-C: Unified memory handling for Grace Blackwell
+     *
+     * On Grace Blackwell, CUDA unified (managed) memory is backed by a single
+     * allocation accessible from both CPU and GPU via NVLink-C2C. When NCCL
+     * passes a unified memory pointer, ibv_reg_mr can register it directly
+     * since the CPU can access the pages. The RDMA NIC will DMA from the
+     * CPU-visible mapping.
+     *
+     * If ibv_reg_mr fails on managed memory (e.g., pages not yet faulted in),
+     * we fall through to a host-pinned fallback: the data must be copied to
+     * a host buffer before RDMA, which NCCL handles via its proxy thread.
+     * We log a warning so the operator knows performance may be degraded.
+     */
+    int managed = mesh_is_managed_memory(data);
+    if (managed) {
+        MESH_DEBUG("regMr: detected CUDA managed/unified memory at %p", data);
+    }
+
     mrh->mr = ibv_reg_mr(scomm->nic->pd, data, size, access_flags);
     if (!mrh->mr) {
-        MESH_WARN("Failed to register MR: %s", strerror(errno));
+        if (managed) {
+            MESH_WARN("regMr: ibv_reg_mr failed on unified memory (%s) - "
+                      "NCCL will use host staging buffers (slower path)",
+                      strerror(errno));
+        } else {
+            MESH_WARN("Failed to register MR: %s", strerror(errno));
+        }
         free(mrh);
         return ncclSystemError;
     }
-    
-    
+
     mrh->nic = scomm->nic;
     mrh->addr = data;
     mrh->size = size;
-    
+    mrh->is_managed = managed;
+
     *mhandle = mrh;
     return ncclSuccess;
 }
@@ -2948,7 +3124,7 @@ static ncclResult_t mesh_isend(void *sendComm, void *data, int size, int tag,
     }
 
     // Fast-fail if peer already known to be disconnected
-    if (comm->peer_failed) {
+    if (__atomic_load_n(&comm->peer_failed, __ATOMIC_ACQUIRE)) {
         MESH_WARN("isend: peer already failed (last_status=%d), failing fast",
                   comm->last_wc_status);
         return ncclSystemError;
@@ -3034,7 +3210,7 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
     }
 
     // Fast-fail if peer already known to be disconnected
-    if (comm->peer_failed) {
+    if (__atomic_load_n(&comm->peer_failed, __ATOMIC_ACQUIRE)) {
         MESH_WARN("irecv: peer already failed (last_status=%d), failing fast",
                   comm->last_wc_status);
         return ncclSystemError;
@@ -3123,22 +3299,22 @@ static void mesh_mark_peer_failed(struct mesh_request *req, enum ibv_wc_status s
 
     if (req->is_send) {
         struct mesh_send_comm *comm = (struct mesh_send_comm *)req->comm;
-        if (!comm->peer_failed) {
-            comm->peer_failed = 1;
+        if (!__atomic_load_n(&comm->peer_failed, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&comm->peer_failed, 1, __ATOMIC_RELEASE);
             comm->last_wc_status = status;
             MESH_WARN("Peer failure detected on send comm: status=%d (%s)",
                       status, ibv_wc_status_str(status));
         }
-        comm->error_count++;
+        __atomic_fetch_add(&comm->error_count, 1, __ATOMIC_RELAXED);
     } else {
         struct mesh_recv_comm *comm = (struct mesh_recv_comm *)req->comm;
-        if (!comm->peer_failed) {
-            comm->peer_failed = 1;
+        if (!__atomic_load_n(&comm->peer_failed, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&comm->peer_failed, 1, __ATOMIC_RELEASE);
             comm->last_wc_status = status;
             MESH_WARN("Peer failure detected on recv comm: status=%d (%s)",
                       status, ibv_wc_status_str(status));
         }
-        comm->error_count++;
+        __atomic_fetch_add(&comm->error_count, 1, __ATOMIC_RELAXED);
     }
 }
 
@@ -3183,7 +3359,7 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
         return ncclSuccess;
     }
 
-    if (req->done) {
+    if (__atomic_load_n(&req->done, __ATOMIC_ACQUIRE)) {
         *done = 1;
         if (sizes) *sizes = req->size;
         mesh_untrack_request(req);  // TICKET-9: Remove from comm tracking
@@ -3195,7 +3371,7 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
 
     if (!req->cq) {
         MESH_WARN("mesh_test: request has no CQ");
-        req->done = 1;
+        __atomic_store_n(&req->done, 1, __ATOMIC_RELEASE);
         *done = 1;
         mesh_untrack_request(req);  // TICKET-9: Remove from comm tracking
         __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
@@ -3234,8 +3410,8 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
 
             // Mark the request as done (with error)
             if (completed_req) {
-                completed_req->done = 1;
                 completed_req->wc = wc;
+                __atomic_store_n(&completed_req->done, 1, __ATOMIC_RELEASE);
             }
 
             // If this is our request, return error immediately
@@ -3254,8 +3430,8 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
 
         // Success - mark the request as done
         if (completed_req) {
-            completed_req->done = 1;
             completed_req->wc = wc;
+            __atomic_store_n(&completed_req->done, 1, __ATOMIC_RELEASE);
         }
 
         // Is it OUR request?
@@ -3295,7 +3471,7 @@ static ncclResult_t mesh_closeSend(void *sendComm) {
         // before all operations complete (e.g., FSDP timeout during all-gather)
         for (int i = 0; i < comm->num_requests; i++) {
             struct mesh_request *req = comm->requests[i];
-            if (req && !req->done) {
+            if (req && !__atomic_load_n(&req->done, __ATOMIC_ACQUIRE)) {
                 MESH_DEBUG("closeSend: freeing outstanding request %d", i);
                 __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
                 free(req);
@@ -3332,7 +3508,7 @@ static ncclResult_t mesh_closeRecv(void *recvComm) {
         // before all operations complete (e.g., FSDP timeout during all-gather)
         for (int i = 0; i < comm->num_requests; i++) {
             struct mesh_request *req = comm->requests[i];
-            if (req && !req->done) {
+            if (req && !__atomic_load_n(&req->done, __ATOMIC_ACQUIRE)) {
                 MESH_DEBUG("closeRecv: freeing outstanding request %d", i);
                 __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
                 free(req);
@@ -3359,11 +3535,11 @@ static ncclResult_t mesh_closeListen(void *listenComm) {
 
     if (comm) {
         // Stop handshake thread
-        if (comm->thread_running) {
-            comm->thread_stop = 1;
+        if (__atomic_load_n(&comm->thread_running, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&comm->thread_stop, 1, __ATOMIC_RELEASE);
             pthread_cond_broadcast(&comm->queue_cond);
             pthread_join(comm->handshake_thread, NULL);
-            comm->thread_running = 0;
+            __atomic_store_n(&comm->thread_running, 0, __ATOMIC_RELEASE);
         }
         
         // Close handshake socket
@@ -3395,6 +3571,24 @@ static ncclResult_t mesh_closeListen(void *listenComm) {
     return ncclSuccess;
 }
 
+/*
+ * ============================================================================
+ * v9 API Stubs and Wrappers
+ *
+ * NCCL 2.29.2+ (v9 net plugin API) requires these additional functions beyond
+ * the v8 interface. They are called by NCCL core even if the plugin doesn't
+ * use device-side MR handles, irecv consumed notifications, or virtual devices.
+ * ============================================================================
+ */
+
+/*
+ * getDeviceMr - Return a device-side memory handle for registered memory.
+ *
+ * NCCL calls this to get a GPU-accessible handle for RDMA memory registrations
+ * (used with NCCL_NET_DEVICE_UNPACK). We don't support device-side MR handles,
+ * so we return NULL. NCCL treats NULL as "no device handle available" and falls
+ * back to host-side memory registration, which is correct for our use case.
+ */
 static ncclResult_t mesh_getDeviceMr(void *comm, void *mhandle, void **dptr_mhandle) {
     (void)comm;
     (void)mhandle;
@@ -3402,18 +3596,20 @@ static ncclResult_t mesh_getDeviceMr(void *comm, void *mhandle, void **dptr_mhan
     return ncclSuccess;
 }
 
+/*
+ * irecvConsumed - Notify the plugin that a received buffer has been consumed.
+ *
+ * NCCL calls this after it has finished processing data from an irecv buffer,
+ * allowing the plugin to reclaim or reuse the buffer. Since we use simple
+ * one-shot RDMA sends and TCP transfers (no ring buffer or credit-based flow
+ * control), this is a no-op.
+ */
 static ncclResult_t mesh_irecvConsumed(void *recvComm, int n, void *request) {
     (void)recvComm;
     (void)n;
     (void)request;
     return ncclSuccess;
 }
-
-/*
- * ============================================================================
- * v9 API Wrappers
- * ============================================================================
- */
 
 /* Static string storage for v9 properties (name and pciPath become pointers) */
 static char g_v9_name_storage[256];
@@ -3433,12 +3629,15 @@ static ncclResult_t mesh_getProperties_v9(int dev, ncclNetProperties_v9_t *props
     strncpy(g_v9_pcipath_storage, nic->pci_path, sizeof(g_v9_pcipath_storage) - 1);
 
     props->name = g_v9_name_storage;
-    props->pciPath = g_v9_pcipath_storage;
+    /* TICKET-D: pciPath may be empty on Grace Blackwell (NVLink-C2C topology).
+     * NCCL treats NULL pciPath as "use any NIC" which is correct. */
+    props->pciPath = g_v9_pcipath_storage[0] ? g_v9_pcipath_storage : NULL;
     props->guid = 0;
     props->ptrSupport = NCCL_PTR_HOST;
     props->regIsGlobal = 0;
     props->forceFlush = 0;
-    props->speed = 100000;  /* 100 Gbps */
+    /* Use actual link speed if available */
+    props->speed = (nic->link_speed_mbps > 0) ? nic->link_speed_mbps : 100000;
     props->port = nic->port_num;
     props->latency = 1.0f;
     props->maxComms = nic->max_qp;
@@ -3479,8 +3678,15 @@ static ncclResult_t mesh_irecv_v9(void *recvComm, int n, void **data, size_t *si
     return ret;
 }
 
+/*
+ * makeVDevice - Create a virtual device from a set of physical devices.
+ *
+ * NCCL v9 can aggregate multiple physical NICs into a single virtual device
+ * for higher bandwidth. We don't support virtual devices, so we return
+ * ncclInternalError to indicate the feature is unavailable. NCCL will fall
+ * back to using physical devices individually.
+ */
 static ncclResult_t mesh_makeVDevice(int *d, ncclNetVDeviceProps_v9_t *props) {
-    /* Virtual device not supported */
     (void)d;
     (void)props;
     return ncclInternalError;

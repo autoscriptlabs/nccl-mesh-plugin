@@ -6,7 +6,7 @@ CFLAGS += -I. -I./include
 # LDFLAGS for systems with libibverbs
 # LDFLAGS = -shared -libverbs -lpthread
 # LDFLAGS for stub/TCP-only build
-LDFLAGS = -shared -lpthread
+LDFLAGS = -shared -lpthread -ldl
 
 # Target
 TARGET = libnccl-net.so
