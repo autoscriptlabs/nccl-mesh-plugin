@@ -2607,6 +2607,203 @@ void mesh_async_event_destroy(void) {
 
 /*
  * ============================================================================
+ * Server Metrics Logging Thread
+ *
+ * Periodically logs per-NIC throughput, latency, in-flight requests, and
+ * connection pool / request leak statistics. This makes transport stalls
+ * visible in logs *before* NCCL's 600s watchdog kills the process.
+ *
+ * The crash signature from the original incident shows the allgather stalled
+ * for exactly 600s with no indication from the plugin. This thread would have
+ * logged zero-throughput and rising in-flight counts within 10 seconds,
+ * providing a clear post-mortem signal for where the stall originated.
+ *
+ * Controlled by:
+ *   NCCL_MESH_METRICS=1          (default: enabled)
+ *   NCCL_MESH_METRICS_INTERVAL_SEC=10  (default: 10 seconds)
+ * ============================================================================
+ */
+
+/*
+ * Snapshot of per-NIC counters at the start of each interval,
+ * so we can compute deltas for throughput/rate reporting.
+ */
+struct mesh_nic_snapshot {
+    uint64_t bytes_sent;
+    uint64_t bytes_recv;
+    uint64_t send_completions;
+    uint64_t recv_completions;
+    uint64_t send_errors;
+    uint64_t recv_errors;
+    uint64_t completion_timeouts;
+    uint64_t ops_completed;
+    uint64_t total_completion_us;
+};
+
+static struct mesh_nic_snapshot g_prev_snap[MESH_MAX_NICS];
+static uint64_t g_prev_ops_completed;
+
+static void *metrics_thread_func(void *arg) {
+    (void)arg;
+
+    MESH_LOG(NCCL_LOG_INFO,
+             "MESH [metrics] Server metrics thread started (interval=%ds, nics=%d)",
+             g_mesh_state.metrics_interval_sec, g_mesh_state.num_nics);
+
+    /* Initialize snapshots to current values to avoid a spurious spike on first report */
+    for (int i = 0; i < g_mesh_state.num_nics; i++) {
+        struct mesh_nic *nic = &g_mesh_state.nics[i];
+        g_prev_snap[i].bytes_sent       = __atomic_load_n(&nic->bytes_sent, __ATOMIC_RELAXED);
+        g_prev_snap[i].bytes_recv       = __atomic_load_n(&nic->bytes_recv, __ATOMIC_RELAXED);
+        g_prev_snap[i].send_completions = __atomic_load_n(&nic->send_completions, __ATOMIC_RELAXED);
+        g_prev_snap[i].recv_completions = __atomic_load_n(&nic->recv_completions, __ATOMIC_RELAXED);
+        g_prev_snap[i].send_errors      = __atomic_load_n(&nic->send_errors, __ATOMIC_RELAXED);
+        g_prev_snap[i].recv_errors      = __atomic_load_n(&nic->recv_errors, __ATOMIC_RELAXED);
+        g_prev_snap[i].completion_timeouts = __atomic_load_n(&nic->completion_timeouts, __ATOMIC_RELAXED);
+        g_prev_snap[i].total_completion_us = __atomic_load_n(&nic->total_completion_us, __ATOMIC_RELAXED);
+    }
+    g_prev_ops_completed = __atomic_load_n(&g_mesh_state.ops_completed, __ATOMIC_RELAXED);
+
+    while (!__atomic_load_n(&g_mesh_state.metrics_thread_stop, __ATOMIC_ACQUIRE)) {
+        /* Sleep for the configured interval, but check stop flag every second */
+        for (int s = 0; s < g_mesh_state.metrics_interval_sec; s++) {
+            if (__atomic_load_n(&g_mesh_state.metrics_thread_stop, __ATOMIC_ACQUIRE))
+                goto done;
+            usleep(1000000);  /* 1 second */
+        }
+
+        /* ── Global summary ───────────────────────────────────────── */
+        uint64_t alloc   = __atomic_load_n(&g_mesh_state.requests_allocated, __ATOMIC_RELAXED);
+        uint64_t freed   = __atomic_load_n(&g_mesh_state.requests_freed, __ATOMIC_RELAXED);
+        uint64_t ops_now = __atomic_load_n(&g_mesh_state.ops_completed, __ATOMIC_RELAXED);
+        uint64_t ops_delta = ops_now - g_prev_ops_completed;
+        int fatal = atomic_load(&g_mesh_state.plugin_fatal_error);
+
+        MESH_LOG(NCCL_LOG_INFO,
+                 "MESH [metrics] ops_completed=%lu (+%lu) outstanding_reqs=%lu "
+                 "pool_hits=%lu pool_misses=%lu fatal=%d",
+                 (unsigned long)ops_now, (unsigned long)ops_delta,
+                 (unsigned long)(alloc - freed),
+                 (unsigned long)g_mesh_state.conn_pool.hits,
+                 (unsigned long)g_mesh_state.conn_pool.misses,
+                 fatal);
+
+        g_prev_ops_completed = ops_now;
+
+        /* ── Per-NIC metrics ──────────────────────────────────────── */
+        for (int i = 0; i < g_mesh_state.num_nics; i++) {
+            struct mesh_nic *nic = &g_mesh_state.nics[i];
+            struct mesh_nic_snapshot *prev = &g_prev_snap[i];
+
+            uint64_t bs  = __atomic_load_n(&nic->bytes_sent, __ATOMIC_RELAXED);
+            uint64_t br  = __atomic_load_n(&nic->bytes_recv, __ATOMIC_RELAXED);
+            uint64_t sc  = __atomic_load_n(&nic->send_completions, __ATOMIC_RELAXED);
+            uint64_t rc  = __atomic_load_n(&nic->recv_completions, __ATOMIC_RELAXED);
+            uint64_t se  = __atomic_load_n(&nic->send_errors, __ATOMIC_RELAXED);
+            uint64_t re  = __atomic_load_n(&nic->recv_errors, __ATOMIC_RELAXED);
+            uint64_t ct  = __atomic_load_n(&nic->completion_timeouts, __ATOMIC_RELAXED);
+            uint64_t as  = __atomic_load_n(&nic->active_sends, __ATOMIC_RELAXED);
+            uint64_t ar  = __atomic_load_n(&nic->active_recvs, __ATOMIC_RELAXED);
+            uint64_t mcu = __atomic_load_n(&nic->max_completion_us, __ATOMIC_RELAXED);
+            uint64_t tcu = __atomic_load_n(&nic->total_completion_us, __ATOMIC_RELAXED);
+
+            /* Compute deltas */
+            uint64_t d_bs  = bs - prev->bytes_sent;
+            uint64_t d_br  = br - prev->bytes_recv;
+            uint64_t d_sc  = sc - prev->send_completions;
+            uint64_t d_rc  = rc - prev->recv_completions;
+            uint64_t d_se  = se - prev->send_errors;
+            uint64_t d_re  = re - prev->recv_errors;
+            uint64_t d_ct  = ct - prev->completion_timeouts;
+            uint64_t d_tcu = tcu - prev->total_completion_us;
+            uint64_t d_completions = d_sc + d_rc;
+
+            /* Throughput in MB/s */
+            int interval = g_mesh_state.metrics_interval_sec;
+            uint64_t send_mbps = (interval > 0) ? d_bs / (1024 * 1024) / (uint64_t)interval : 0;
+            uint64_t recv_mbps = (interval > 0) ? d_br / (1024 * 1024) / (uint64_t)interval : 0;
+
+            /* Average completion latency for this interval */
+            uint64_t avg_us = (d_completions > 0) ? d_tcu / d_completions : 0;
+
+            char ip_buf[INET_ADDRSTRLEN];
+            mesh_uint_to_ip(nic->ip_addr, ip_buf, sizeof(ip_buf));
+
+            MESH_LOG(NCCL_LOG_INFO,
+                     "MESH [metrics] NIC %s (%s): "
+                     "tx=%luMB/s rx=%luMB/s "
+                     "send_ok=+%lu recv_ok=+%lu "
+                     "send_err=+%lu recv_err=+%lu timeouts=+%lu "
+                     "inflight_send=%lu inflight_recv=%lu "
+                     "avg_lat=%luus max_lat=%luus",
+                     nic->dev_name, ip_buf,
+                     (unsigned long)send_mbps, (unsigned long)recv_mbps,
+                     (unsigned long)d_sc, (unsigned long)d_rc,
+                     (unsigned long)d_se, (unsigned long)d_re,
+                     (unsigned long)d_ct,
+                     (unsigned long)as, (unsigned long)ar,
+                     (unsigned long)avg_us, (unsigned long)mcu);
+
+            /* Stall detection: in-flight requests > 0 but zero completions in this interval */
+            if ((as + ar) > 0 && d_completions == 0 && d_se == 0 && d_re == 0) {
+                MESH_LOG(NCCL_LOG_WARN,
+                         "MESH [metrics] WARNING: NIC %s (%s) has %lu in-flight "
+                         "requests but ZERO completions in last %ds — possible transport stall!",
+                         nic->dev_name, ip_buf,
+                         (unsigned long)(as + ar), interval);
+            }
+
+            /* Update snapshot */
+            prev->bytes_sent       = bs;
+            prev->bytes_recv       = br;
+            prev->send_completions = sc;
+            prev->recv_completions = rc;
+            prev->send_errors      = se;
+            prev->recv_errors      = re;
+            prev->completion_timeouts = ct;
+            prev->total_completion_us = tcu;
+        }
+    }
+
+done:
+    MESH_LOG(NCCL_LOG_INFO, "MESH [metrics] Server metrics thread stopped");
+    return NULL;
+}
+
+int mesh_metrics_init(void) {
+    if (!g_mesh_state.metrics_enabled) {
+        return 0;
+    }
+
+    __atomic_store_n(&g_mesh_state.metrics_thread_stop, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_mesh_state.metrics_thread_running, 0, __ATOMIC_RELAXED);
+
+    if (pthread_create(&g_mesh_state.metrics_thread, NULL,
+                       metrics_thread_func, NULL) != 0) {
+        MESH_WARN("Failed to create metrics thread: %s", strerror(errno));
+        return -1;
+    }
+
+    __atomic_store_n(&g_mesh_state.metrics_thread_running, 1, __ATOMIC_RELEASE);
+    MESH_LOG(NCCL_LOG_INFO, "MESH [metrics] Initialized (interval=%ds)",
+             g_mesh_state.metrics_interval_sec);
+    return 0;
+}
+
+void mesh_metrics_destroy(void) {
+    if (!__atomic_load_n(&g_mesh_state.metrics_thread_running, __ATOMIC_ACQUIRE)) {
+        return;
+    }
+
+    __atomic_store_n(&g_mesh_state.metrics_thread_stop, 1, __ATOMIC_RELEASE);
+    pthread_join(g_mesh_state.metrics_thread, NULL);
+    __atomic_store_n(&g_mesh_state.metrics_thread_running, 0, __ATOMIC_RELEASE);
+
+    MESH_LOG(NCCL_LOG_INFO, "MESH [metrics] Destroyed");
+}
+
+/*
+ * ============================================================================
  * NCCL Plugin API Implementation
  * ============================================================================
  */
@@ -2683,6 +2880,15 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
     env_val = getenv("NCCL_MESH_FATAL_ON_TIMEOUT");
     g_mesh_state.fatal_on_timeout = env_val ? atoi(env_val) : 1;
 
+    // NCCL_MESH_METRICS: Enable periodic server metrics logging (default: 1)
+    env_val = getenv("NCCL_MESH_METRICS");
+    g_mesh_state.metrics_enabled = env_val ? atoi(env_val) : 1;
+
+    // NCCL_MESH_METRICS_INTERVAL_SEC: Metrics reporting interval (default: 10s)
+    env_val = getenv("NCCL_MESH_METRICS_INTERVAL_SEC");
+    g_mesh_state.metrics_interval_sec = env_val ? atoi(env_val) : 10;
+    if (g_mesh_state.metrics_interval_sec < 1) g_mesh_state.metrics_interval_sec = 1;
+
     // Initialize atomic fatal error flag
     atomic_store(&g_mesh_state.plugin_fatal_error, 0);
 
@@ -2697,6 +2903,8 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
              g_mesh_state.op_timeout_sec, g_mesh_state.connect_timeout_sec,
              g_mesh_state.accept_timeout_sec, g_mesh_state.health_check_interval_ms,
              g_mesh_state.fatal_on_timeout);
+    MESH_LOG(NCCL_LOG_INFO, "MESH Server metrics: enabled=%d interval=%ds",
+             g_mesh_state.metrics_enabled, g_mesh_state.metrics_interval_sec);
 
     // Verify handle struct size fits in NCCL limits (NCCL_NET_HANDLE_MAXSIZE = 128)
     MESH_LOG(NCCL_LOG_INFO, "MESH Handle size: %zu bytes (max 128)", sizeof(struct mesh_handle));
@@ -2760,6 +2968,13 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
         MESH_WARN("Async event monitoring failed to start - "
                   "device/port fatal events will not be detected proactively");
         // Non-fatal - we still have per-operation timeout detection
+    }
+
+    // Start server metrics logging thread
+    if (mesh_metrics_init() != 0) {
+        MESH_WARN("Server metrics thread failed to start - "
+                  "periodic metrics logging will be unavailable");
+        // Non-fatal - plugin still works, just no periodic metrics
     }
 
     g_mesh_state.initialized = 1;
@@ -3381,6 +3596,13 @@ static ncclResult_t mesh_isend(void *sendComm, void *data, int size, int tag,
         return ncclSystemError;
     }
 
+    // Per-NIC metrics: track send op and in-flight count
+    if (comm->nic) {
+        __atomic_fetch_add(&comm->nic->send_ops, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&comm->nic->bytes_sent, size, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&comm->nic->active_sends, 1, __ATOMIC_RELAXED);
+    }
+
     // TICKET-9: Track request in comm for cleanup on close
     // This prevents memory leaks when operations hang and comm is closed
     if (comm->num_requests < MESH_MAX_QPS) {
@@ -3473,6 +3695,13 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
         return ncclSystemError;
     }
 
+    // Per-NIC metrics: track recv op and in-flight count
+    if (comm->nic) {
+        __atomic_fetch_add(&comm->nic->recv_ops, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&comm->nic->bytes_recv, sizes[0], __ATOMIC_RELAXED);
+        __atomic_fetch_add(&comm->nic->active_recvs, 1, __ATOMIC_RELAXED);
+    }
+
     // TICKET-9: Track request in comm for cleanup on close
     // This prevents memory leaks when operations hang and comm is closed
     if (comm->num_requests < MESH_MAX_QPS) {
@@ -3543,6 +3772,67 @@ static void mesh_mark_peer_failed(struct mesh_request *req, enum ibv_wc_status s
 }
 
 /*
+ * Get the NIC associated with a request (via its comm).
+ * Returns NULL if the request has no tracked comm.
+ */
+static struct mesh_nic* mesh_request_nic(struct mesh_request *req) {
+    if (!req || !req->comm) return NULL;
+    if (req->is_send) {
+        return ((struct mesh_send_comm *)req->comm)->nic;
+    } else {
+        return ((struct mesh_recv_comm *)req->comm)->nic;
+    }
+}
+
+/*
+ * Record completion metrics for a request: latency, success/error, in-flight decrement.
+ */
+static void mesh_record_completion(struct mesh_request *req, int success) {
+    struct mesh_nic *nic = mesh_request_nic(req);
+    if (!nic) return;
+
+    /* Decrement in-flight counter */
+    if (req->is_send) {
+        uint64_t cur = __atomic_load_n(&nic->active_sends, __ATOMIC_RELAXED);
+        if (cur > 0) __atomic_fetch_sub(&nic->active_sends, 1, __ATOMIC_RELAXED);
+    } else {
+        uint64_t cur = __atomic_load_n(&nic->active_recvs, __ATOMIC_RELAXED);
+        if (cur > 0) __atomic_fetch_sub(&nic->active_recvs, 1, __ATOMIC_RELAXED);
+    }
+
+    if (success) {
+        /* Record success and latency */
+        if (req->is_send) {
+            __atomic_fetch_add(&nic->send_completions, 1, __ATOMIC_RELAXED);
+        } else {
+            __atomic_fetch_add(&nic->recv_completions, 1, __ATOMIC_RELAXED);
+        }
+
+        /* Compute completion latency */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        uint64_t elapsed_us = (uint64_t)(now.tv_sec - req->start_time.tv_sec) * 1000000ULL
+                            + (uint64_t)(now.tv_nsec - req->start_time.tv_nsec) / 1000ULL;
+        __atomic_fetch_add(&nic->total_completion_us, elapsed_us, __ATOMIC_RELAXED);
+
+        /* Update max latency (relaxed CAS loop) */
+        uint64_t prev_max = __atomic_load_n(&nic->max_completion_us, __ATOMIC_RELAXED);
+        while (elapsed_us > prev_max) {
+            if (__atomic_compare_exchange_n(&nic->max_completion_us, &prev_max,
+                                            elapsed_us, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+                break;
+        }
+    } else {
+        /* Record error */
+        if (req->is_send) {
+            __atomic_fetch_add(&nic->send_errors, 1, __ATOMIC_RELAXED);
+        } else {
+            __atomic_fetch_add(&nic->recv_errors, 1, __ATOMIC_RELAXED);
+        }
+    }
+}
+
+/*
  * TICKET-9: Remove request from comm's tracking array before freeing
  * This prevents dangling pointers in the comm->requests[] array
  */
@@ -3596,6 +3886,7 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
     if (__atomic_load_n(&req->done, __ATOMIC_ACQUIRE)) {
         *done = 1;
         if (sizes) *sizes = req->size;
+        mesh_record_completion(req, 1);  // Per-NIC metrics: success
         mesh_untrack_request(req);  // TICKET-9: Remove from comm tracking
         __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
@@ -3662,7 +3953,14 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
                     "(expected_bytes=%zu, timeout=%ds)",
                     elapsed_sec, req->size, g_mesh_state.op_timeout_sec);
 
+                // Per-NIC metrics: record timeout
+                {
+                    struct mesh_nic *nic = mesh_request_nic(req);
+                    if (nic) __atomic_fetch_add(&nic->completion_timeouts, 1, __ATOMIC_RELAXED);
+                }
+
                 if (g_mesh_state.fatal_on_timeout) {
+                    mesh_record_completion(req, 0);  // Per-NIC metrics: error
                     *done = 1;
                     mesh_untrack_request(req);
                     __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
@@ -3720,6 +4018,7 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
             if (completed_req) {
                 completed_req->wc = wc;
                 __atomic_store_n(&completed_req->done, 1, __ATOMIC_RELEASE);
+                mesh_record_completion(completed_req, 0);  // Per-NIC metrics: error
             }
 
             // If this is our request, return error immediately
@@ -3744,6 +4043,7 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
 
         // Is it OUR request?
         if (completed_req == req) {
+            mesh_record_completion(req, 1);  // Per-NIC metrics: success + latency
             *done = 1;
             if (sizes) *sizes = req->size;
             mesh_untrack_request(req);  // TICKET-9: Remove from comm tracking
@@ -3759,6 +4059,9 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
             }
             free(req);  // TICKET-8: Free request on success completion
             return ncclSuccess;
+        } else if (completed_req) {
+            // Not our request but completed successfully - record its metrics too
+            mesh_record_completion(completed_req, 1);
         }
 
         // Not our request - keep polling

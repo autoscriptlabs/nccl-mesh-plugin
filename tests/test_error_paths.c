@@ -457,6 +457,38 @@ static void test_plugin_state_fields(void) {
 }
 
 /*
+ * Test: Server metrics fields exist on NIC and plugin state
+ */
+static void test_metrics_fields(void) {
+    printf("\nTest: Server metrics fields\n");
+
+    struct mesh_nic nic;
+    memset(&nic, 0, sizeof(nic));
+
+    /* Per-NIC metrics counters should exist and be zero-initialized */
+    TEST_ASSERT(nic.send_ops == 0, "send_ops should be zero-initialized");
+    TEST_ASSERT(nic.recv_ops == 0, "recv_ops should be zero-initialized");
+    TEST_ASSERT(nic.send_completions == 0, "send_completions should be zero-initialized");
+    TEST_ASSERT(nic.recv_completions == 0, "recv_completions should be zero-initialized");
+    TEST_ASSERT(nic.send_errors == 0, "send_errors should be zero-initialized");
+    TEST_ASSERT(nic.recv_errors == 0, "recv_errors should be zero-initialized");
+    TEST_ASSERT(nic.completion_timeouts == 0, "completion_timeouts should be zero-initialized");
+    TEST_ASSERT(nic.max_completion_us == 0, "max_completion_us should be zero-initialized");
+    TEST_ASSERT(nic.total_completion_us == 0, "total_completion_us should be zero-initialized");
+    TEST_ASSERT(nic.active_sends == 0, "active_sends should be zero-initialized");
+    TEST_ASSERT(nic.active_recvs == 0, "active_recvs should be zero-initialized");
+
+    /* Plugin state metrics config fields */
+    struct mesh_plugin_state state;
+    memset(&state, 0, sizeof(state));
+
+    state.metrics_enabled = 1;
+    state.metrics_interval_sec = 10;
+    TEST_ASSERT(state.metrics_enabled == 1, "metrics_enabled field exists");
+    TEST_ASSERT(state.metrics_interval_sec == 10, "metrics_interval_sec field exists");
+}
+
+/*
  * Main
  */
 int main(void) {
@@ -477,6 +509,7 @@ int main(void) {
     test_handle_size();
     test_event_type_str();
     test_plugin_state_fields();
+    test_metrics_fields();
 
     printf("\n====================================\n");
     printf("Results: %d passed, %d failed, %d total\n",
