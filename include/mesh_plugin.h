@@ -67,6 +67,19 @@ struct mesh_nic {
     uint64_t bytes_recv;
     uint64_t connections;
 
+    // Per-NIC metrics (atomically updated by isend/irecv/test)
+    uint64_t send_ops;              // Total send operations posted
+    uint64_t recv_ops;              // Total recv operations posted
+    uint64_t send_completions;      // Successful send completions
+    uint64_t recv_completions;      // Successful recv completions
+    uint64_t send_errors;           // Send WC errors
+    uint64_t recv_errors;           // Recv WC errors
+    uint64_t completion_timeouts;   // Operations that hit op_timeout_sec
+    uint64_t max_completion_us;     // Max completion latency in microseconds
+    uint64_t total_completion_us;   // Sum of completion latencies for avg calc
+    uint64_t active_sends;          // Currently in-flight send requests
+    uint64_t active_recvs;          // Currently in-flight recv requests
+
     // Link speed and lane classification (for topology routing)
     int link_speed_mbps;        // Link speed in Mbps (e.g., 100000 for 100Gbps)
     int lane;                   // Lane classification (enum mesh_nic_lane from mesh_routing.h)
@@ -418,6 +431,15 @@ struct mesh_plugin_state {
     uint64_t tcp_requests_freed;        // TCP requests freed
     uint64_t ops_completed;             // Total send/recv operations completed
 
+    // Server metrics logging configuration
+    int metrics_enabled;                // NCCL_MESH_METRICS: enable periodic metrics (default: 1)
+    int metrics_interval_sec;           // NCCL_MESH_METRICS_INTERVAL_SEC: log interval (default: 10)
+
+    // Server metrics logging thread
+    pthread_t metrics_thread;           // Periodic metrics reporter
+    int metrics_thread_running;         // 1 if thread is active
+    int metrics_thread_stop;            // 1 to signal thread to stop
+
     // Logging (provided by NCCL)
     void (*log_fn)(int level, unsigned long flags, const char *file,
                    int line, const char *fmt, ...);
@@ -475,6 +497,10 @@ int mesh_async_connect_poll(struct mesh_async_connect_req *req);
 // NCCL-001: Async event monitoring
 int mesh_async_event_init(void);
 void mesh_async_event_destroy(void);
+
+// Server metrics logging
+int mesh_metrics_init(void);
+void mesh_metrics_destroy(void);
 
 // TCP fallback operations (TICKET-4)
 int mesh_tcp_init(void);
