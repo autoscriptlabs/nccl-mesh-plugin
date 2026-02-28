@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <time.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <limits.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -22,6 +23,7 @@
 #include <net/if.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <poll.h>
 #include <dlfcn.h>
 
 #include <infiniband/verbs.h>
@@ -651,11 +653,20 @@ int mesh_accept_handshake(int listen_sock, struct mesh_qp_info *remote_info, str
         MESH_WARN("Failed to accept handshake connection: %s", strerror(errno));
         return -1;
     }
-    
+
+    // NCCL-001: Set socket timeouts to prevent indefinite blocking
+    {
+        struct timeval tv;
+        tv.tv_sec = g_mesh_state.connect_timeout_sec;
+        tv.tv_usec = 0;
+        setsockopt(conn_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(conn_sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    }
+
     char ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &addr.sin_addr, ip_str, sizeof(ip_str));
     MESH_INFO("Accepted handshake connection from %s:%d", ip_str, ntohs(addr.sin_port));
-    
+
     // Receive remote QP info
     ssize_t n = recv(conn_sock, remote_info, sizeof(*remote_info), MSG_WAITALL);
     if (n != sizeof(*remote_info)) {
@@ -762,10 +773,20 @@ int mesh_send_handshake(uint32_t remote_ip, uint16_t remote_port,
     }
     
     // Set back to blocking for send/recv
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
-    
-    
+    {
+        int flags = fcntl(sock, F_GETFL, 0);
+        fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
+    }
+
+    // NCCL-001: Set socket timeouts to prevent indefinite blocking on send/recv
+    {
+        struct timeval tv;
+        tv.tv_sec = g_mesh_state.connect_timeout_sec;
+        tv.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    }
+
     // Send our QP info
     ssize_t n = send(sock, local_info, sizeof(*local_info), 0);
     if (n != sizeof(*local_info)) {
@@ -815,15 +836,26 @@ static void *handshake_thread_func(void *arg) {
         
         char ip_str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &addr.sin_addr, ip_str, sizeof(ip_str));
-        
+
+        // NCCL-001: Set socket timeouts on accepted handshake connections
+        {
+            struct timeval tv;
+            tv.tv_sec = g_mesh_state.connect_timeout_sec;
+            tv.tv_usec = 0;
+            setsockopt(conn_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(conn_sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        }
+
         // Receive remote QP info
         struct mesh_qp_info remote_info;
         ssize_t n = recv(conn_sock, &remote_info, sizeof(remote_info), MSG_WAITALL);
         if (n != sizeof(remote_info)) {
+            MESH_WARN("Handshake thread: failed to receive QP info from %s "
+                      "(got %zd bytes, expected %zu)", ip_str, n, sizeof(remote_info));
             close(conn_sock);
             continue;
         }
-        
+
         MESH_DEBUG("Handshake thread: received QP %u, nic_idx=%d", ntohl(remote_info.qp_num), remote_info.nic_idx);
 
         // Select NIC based on nic_idx from remote
@@ -2451,6 +2483,130 @@ static ncclResult_t mesh_tcp_closeListen(void *listenComm) {
 
 /*
  * ============================================================================
+ * NCCL-001: Helper to get connection age in seconds
+ * ============================================================================
+ */
+static uint64_t mesh_conn_age_sec(const struct timespec *established) {
+    if (established->tv_sec == 0 && established->tv_nsec == 0) return 0;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)(now.tv_sec - established->tv_sec);
+}
+
+/*
+ * ============================================================================
+ * NCCL-001: Check if plugin has encountered a fatal async event
+ * All operations check this flag early and fail fast if set.
+ * ============================================================================
+ */
+static int mesh_check_fatal_error(void) {
+    return atomic_load(&g_mesh_state.plugin_fatal_error);
+}
+
+/*
+ * ============================================================================
+ * NCCL-001: Async Event Monitoring Thread (Work Item 3)
+ *
+ * Monitors ibv_get_async_event on each device context for catastrophic
+ * conditions: port down, device fatal, QP catastrophic error. Sets an
+ * atomic flag that all other operations check.
+ * ============================================================================
+ */
+static int mesh_is_fatal_async_event(enum ibv_event_type type) {
+    switch (type) {
+        case IBV_EVENT_PORT_ERR:
+        case IBV_EVENT_DEVICE_FATAL:
+        case IBV_EVENT_QP_FATAL:
+        case IBV_EVENT_QP_ACCESS_ERR:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static void *async_event_thread_func(void *arg) {
+    (void)arg;
+
+    MESH_INFO("NCCL-001: Async event monitoring thread started for %d NICs",
+              g_mesh_state.num_nics);
+
+    while (!__atomic_load_n(&g_mesh_state.async_event_thread_stop, __ATOMIC_ACQUIRE)) {
+        // Poll each NIC's context for async events using poll() with timeout
+        for (int i = 0; i < g_mesh_state.num_nics; i++) {
+            struct ibv_context *ctx = g_mesh_state.nics[i].context;
+            if (!ctx) continue;
+
+            // Use poll() on async_fd with short timeout to stay responsive to stop signal
+            struct pollfd pfd;
+            pfd.fd = ctx->async_fd;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+
+            int rc = poll(&pfd, 1, g_mesh_state.health_check_interval_ms / g_mesh_state.num_nics);
+            if (rc <= 0) continue;  // Timeout or error - check next NIC
+
+            struct ibv_async_event event;
+            if (ibv_get_async_event(ctx, &event) != 0) continue;
+
+            const char *event_name = ibv_event_type_str(event.event_type);
+
+            if (mesh_is_fatal_async_event(event.event_type)) {
+                MESH_WARN("[MESH-PLUGIN FATAL] Async event on NIC %s: %s — "
+                          "marking plugin as fatally errored, all operations will fail",
+                          g_mesh_state.nics[i].dev_name, event_name);
+
+                snprintf(g_mesh_state.fatal_error_msg,
+                         sizeof(g_mesh_state.fatal_error_msg),
+                         "Fatal async event: %s on NIC %s",
+                         event_name, g_mesh_state.nics[i].dev_name);
+
+                atomic_store(&g_mesh_state.plugin_fatal_error, 1);
+            } else {
+                MESH_INFO("Async event on NIC %s: %s (non-fatal)",
+                          g_mesh_state.nics[i].dev_name, event_name);
+            }
+
+            ibv_ack_async_event(&event);
+        }
+    }
+
+    MESH_INFO("NCCL-001: Async event monitoring thread stopped");
+    return NULL;
+}
+
+int mesh_async_event_init(void) {
+    if (g_mesh_state.num_nics == 0 || g_mesh_state.tcp_fallback_active) {
+        return 0;  // Nothing to monitor in TCP mode
+    }
+
+    __atomic_store_n(&g_mesh_state.async_event_thread_stop, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_mesh_state.async_event_thread_running, 0, __ATOMIC_RELAXED);
+
+    if (pthread_create(&g_mesh_state.async_event_thread, NULL,
+                       async_event_thread_func, NULL) != 0) {
+        MESH_WARN("Failed to create async event monitoring thread: %s", strerror(errno));
+        return -1;
+    }
+
+    __atomic_store_n(&g_mesh_state.async_event_thread_running, 1, __ATOMIC_RELEASE);
+    MESH_INFO("NCCL-001: Async event monitoring thread initialized");
+    return 0;
+}
+
+void mesh_async_event_destroy(void) {
+    if (!__atomic_load_n(&g_mesh_state.async_event_thread_running, __ATOMIC_ACQUIRE)) {
+        return;
+    }
+
+    __atomic_store_n(&g_mesh_state.async_event_thread_stop, 1, __ATOMIC_RELEASE);
+    pthread_join(g_mesh_state.async_event_thread, NULL);
+    __atomic_store_n(&g_mesh_state.async_event_thread_running, 0, __ATOMIC_RELEASE);
+
+    MESH_INFO("NCCL-001: Async event monitoring thread destroyed");
+}
+
+/*
+ * ============================================================================
  * NCCL Plugin API Implementation
  * ============================================================================
  */
@@ -2502,12 +2658,45 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
     env_val = getenv("NCCL_MESH_ASYNC_CONNECT");
     g_mesh_state.enable_async_connect = env_val ? atoi(env_val) : 1;
 
+    // NCCL-001: Error hardening configuration
+    // NCCL_MESH_TIMEOUT_SEC: Per-operation completion timeout (default: 30s)
+    env_val = getenv("NCCL_MESH_TIMEOUT_SEC");
+    g_mesh_state.op_timeout_sec = env_val ? atoi(env_val) : 30;
+    if (g_mesh_state.op_timeout_sec < 1) g_mesh_state.op_timeout_sec = 1;
+
+    // NCCL_MESH_CONNECT_TIMEOUT_SEC: TCP handshake timeout (default: 10s)
+    env_val = getenv("NCCL_MESH_CONNECT_TIMEOUT_SEC");
+    g_mesh_state.connect_timeout_sec = env_val ? atoi(env_val) : 10;
+    if (g_mesh_state.connect_timeout_sec < 1) g_mesh_state.connect_timeout_sec = 1;
+
+    // NCCL_MESH_ACCEPT_TIMEOUT_SEC: Accept queue wait timeout (default: 30s)
+    env_val = getenv("NCCL_MESH_ACCEPT_TIMEOUT_SEC");
+    g_mesh_state.accept_timeout_sec = env_val ? atoi(env_val) : 30;
+    if (g_mesh_state.accept_timeout_sec < 1) g_mesh_state.accept_timeout_sec = 1;
+
+    // NCCL_MESH_HEALTH_CHECK_INTERVAL_MS: QP state polling interval (default: 1000ms)
+    env_val = getenv("NCCL_MESH_HEALTH_CHECK_INTERVAL_MS");
+    g_mesh_state.health_check_interval_ms = env_val ? atoi(env_val) : 1000;
+    if (g_mesh_state.health_check_interval_ms < 100) g_mesh_state.health_check_interval_ms = 100;
+
+    // NCCL_MESH_FATAL_ON_TIMEOUT: Return ncclInternalError on timeout (default: 1)
+    env_val = getenv("NCCL_MESH_FATAL_ON_TIMEOUT");
+    g_mesh_state.fatal_on_timeout = env_val ? atoi(env_val) : 1;
+
+    // Initialize atomic fatal error flag
+    atomic_store(&g_mesh_state.plugin_fatal_error, 0);
+
     // Log configuration (always shown at init, regardless of debug level)
     MESH_LOG(NCCL_LOG_INFO, "MESH Initializing: gid=%d debug=%d fast_fail=%d timeout=%dms retries=%d "
              "disable_rdma=%d conn_pool=%d async_connect=%d",
              g_mesh_state.gid_index, g_mesh_state.debug_level, g_mesh_state.fast_fail,
              g_mesh_state.timeout_ms, g_mesh_state.retry_count, g_mesh_state.disable_rdma,
              g_mesh_state.enable_conn_pool, g_mesh_state.enable_async_connect);
+    MESH_LOG(NCCL_LOG_INFO, "MESH Error hardening: op_timeout=%ds connect_timeout=%ds "
+             "accept_timeout=%ds health_check=%dms fatal_on_timeout=%d",
+             g_mesh_state.op_timeout_sec, g_mesh_state.connect_timeout_sec,
+             g_mesh_state.accept_timeout_sec, g_mesh_state.health_check_interval_ms,
+             g_mesh_state.fatal_on_timeout);
 
     // Verify handle struct size fits in NCCL limits (NCCL_NET_HANDLE_MAXSIZE = 128)
     MESH_LOG(NCCL_LOG_INFO, "MESH Handle size: %zu bytes (max 128)", sizeof(struct mesh_handle));
@@ -2564,6 +2753,13 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
     if (mesh_relay_init() != 0) {
         MESH_WARN("Relay initialization failed, relay routing disabled");
         // Non-fatal - we can still work with direct connections only
+    }
+
+    // NCCL-001: Start async event monitoring thread
+    if (mesh_async_event_init() != 0) {
+        MESH_WARN("Async event monitoring failed to start - "
+                  "device/port fatal events will not be detected proactively");
+        // Non-fatal - we still have per-operation timeout detection
     }
 
     g_mesh_state.initialized = 1;
@@ -2736,11 +2932,17 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
 
     (void)dev;  // We pick the right NIC based on subnet match
 
+    // NCCL-001: Check for fatal async event before connection attempt
+    if (mesh_check_fatal_error()) {
+        MESH_WARN("connect: plugin in fatal error state — %s", g_mesh_state.fatal_error_msg);
+        return ncclInternalError;
+    }
+
     struct mesh_handle *handle = (struct mesh_handle *)opaqueHandle;
     struct mesh_send_comm *comm;
     struct mesh_nic *nic = NULL;
     struct mesh_addr_entry *selected_addr = NULL;
-    
+
     // Validate handle
     if (handle->magic != MESH_HANDLE_MAGIC) {
         MESH_WARN("Invalid handle magic: 0x%x (expected 0x%x)", handle->magic, MESH_HANDLE_MAGIC);
@@ -2935,6 +3137,7 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
 
     comm->connected = 1;
     comm->remote_qp_num = connect_handle.qp_num;
+    clock_gettime(CLOCK_MONOTONIC, &comm->conn_established_time);  // NCCL-001
 
     // TICKET-6: Add new connection to pool
     if (g_mesh_state.enable_conn_pool) {
@@ -2960,9 +3163,14 @@ static ncclResult_t mesh_accept(void *listenComm, void **recvComm,
         return mesh_tcp_accept_impl(listenComm, recvComm, recvDevComm);
     }
 
+    // NCCL-001: Check for fatal async event before accept
+    if (mesh_check_fatal_error()) {
+        MESH_WARN("accept: plugin in fatal error state — %s", g_mesh_state.fatal_error_msg);
+        return ncclInternalError;
+    }
+
     struct mesh_listen_comm *lcomm = (struct mesh_listen_comm *)listenComm;
     struct mesh_recv_comm *rcomm;
-
 
     // Allocate recv comm
     rcomm = calloc(1, sizeof(*rcomm));
@@ -2972,13 +3180,11 @@ static ncclResult_t mesh_accept(void *listenComm, void **recvComm,
     
     // Wait for handshake from queue (filled by handshake thread)
     pthread_mutex_lock(&lcomm->queue_mutex);
-    
-    // Wait with timeout for entry in queue
+
+    // NCCL-001: Wait with configurable timeout (NCCL_MESH_ACCEPT_TIMEOUT_SEC)
     struct timespec timeout;
     clock_gettime(CLOCK_REALTIME, &timeout);
-    // Accept timeout is 6x configured timeout (default: 30s for 5000ms config)
-    timeout.tv_sec += (g_mesh_state.timeout_ms / 1000) * 6;
-    if (timeout.tv_sec < 5) timeout.tv_sec = 5;  // Minimum 5 second timeout
+    timeout.tv_sec += g_mesh_state.accept_timeout_sec;
     
     while (lcomm->queue_head == lcomm->queue_tail) {
         int rc = pthread_cond_timedwait(&lcomm->queue_cond, &lcomm->queue_mutex, &timeout);
@@ -3004,7 +3210,10 @@ static ncclResult_t mesh_accept(void *listenComm, void **recvComm,
     
     
     rcomm->connected = 1;
-    
+    clock_gettime(CLOCK_MONOTONIC, &rcomm->conn_established_time);  // NCCL-001
+    // Extract peer IP from handshake info for error logging
+    rcomm->peer_ip = ntohl(entry->remote_info.ip);
+
     MESH_INFO("accept: Ready on %s (QP %d)", rcomm->nic->dev_name, rcomm->qp->qp_num);
     
     *recvComm = rcomm;
@@ -3114,6 +3323,12 @@ static ncclResult_t mesh_isend(void *sendComm, void *data, int size, int tag,
 
     MESH_DEBUG("isend: comm=%p, data=%p, size=%d", (void*)comm, data, size);
 
+    // NCCL-001: Check for fatal async event before any operation
+    if (mesh_check_fatal_error()) {
+        MESH_WARN("isend: plugin in fatal error state — %s", g_mesh_state.fatal_error_msg);
+        return ncclInternalError;
+    }
+
     if (!comm || !comm->qp) {
         MESH_WARN("isend: invalid comm");
         return ncclSystemError;
@@ -3127,7 +3342,7 @@ static ncclResult_t mesh_isend(void *sendComm, void *data, int size, int tag,
     if (__atomic_load_n(&comm->peer_failed, __ATOMIC_ACQUIRE)) {
         MESH_WARN("isend: peer already failed (last_status=%d), failing fast",
                   comm->last_wc_status);
-        return ncclSystemError;
+        return ncclInternalError;
     }
 
     req = calloc(1, sizeof(*req));
@@ -3142,6 +3357,7 @@ static ncclResult_t mesh_isend(void *sendComm, void *data, int size, int tag,
     req->done = 0;
     req->comm = comm;    // Track comm for error propagation
     req->is_send = 1;
+    clock_gettime(CLOCK_MONOTONIC, &req->start_time);  // NCCL-001: Record creation time
 
     // Setup scatter/gather entry
     sge.addr = (uintptr_t)data;
@@ -3191,6 +3407,12 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
 
     MESH_DEBUG("irecv: comm=%p, n=%d, sizes[0]=%d", (void*)comm, n, sizes ? sizes[0] : 0);
 
+    // NCCL-001: Check for fatal async event before any operation
+    if (mesh_check_fatal_error()) {
+        MESH_WARN("irecv: plugin in fatal error state — %s", g_mesh_state.fatal_error_msg);
+        return ncclInternalError;
+    }
+
     if (!comm || !comm->qp) {
         MESH_WARN("irecv: invalid comm");
         return ncclSystemError;
@@ -3213,7 +3435,7 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
     if (__atomic_load_n(&comm->peer_failed, __ATOMIC_ACQUIRE)) {
         MESH_WARN("irecv: peer already failed (last_status=%d), failing fast",
                   comm->last_wc_status);
-        return ncclSystemError;
+        return ncclInternalError;
     }
 
     uint32_t lkey = mrh->mr->lkey;
@@ -3230,6 +3452,7 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
     req->done = 0;
     req->comm = comm;    // Track comm for error propagation
     req->is_send = 0;
+    clock_gettime(CLOCK_MONOTONIC, &req->start_time);  // NCCL-001: Record creation time
 
     // Setup scatter/gather entry
     sge.addr = (uintptr_t)data[0];
@@ -3278,12 +3501,13 @@ static ncclResult_t mesh_iflush(void *recvComm, int n, void **data, int *sizes,
  */
 static int mesh_is_peer_failure(enum ibv_wc_status status) {
     switch (status) {
-        case IBV_WC_RETRY_EXC_ERR:      // Transport retry counter exceeded
-        case IBV_WC_RNR_RETRY_EXC_ERR:  // RNR retry counter exceeded
+        case IBV_WC_RETRY_EXC_ERR:      // Transport retry counter exceeded (remote unreachable)
+        case IBV_WC_RNR_RETRY_EXC_ERR:  // RNR retry counter exceeded (remote not ready)
         case IBV_WC_REM_ABORT_ERR:      // Remote abort
         case IBV_WC_REM_ACCESS_ERR:     // Remote access error
         case IBV_WC_REM_INV_REQ_ERR:    // Remote invalid request
         case IBV_WC_REM_OP_ERR:         // Remote operation error
+        case IBV_WC_WR_FLUSH_ERR:       // NCCL-001: QP in error state, all pending WRs flushed
             return 1;
         default:
             return 0;
@@ -3359,6 +3583,16 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
         return ncclSuccess;
     }
 
+    // NCCL-001: Check for fatal async event
+    if (mesh_check_fatal_error()) {
+        MESH_WARN("mesh_test: plugin in fatal error state — %s", g_mesh_state.fatal_error_msg);
+        *done = 1;
+        mesh_untrack_request(req);
+        __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
+        free(req);
+        return ncclInternalError;
+    }
+
     if (__atomic_load_n(&req->done, __ATOMIC_ACQUIRE)) {
         *done = 1;
         if (sizes) *sizes = req->size;
@@ -3389,7 +3623,55 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
         }
 
         if (ret == 0) {
-            // No more completions - our request is not done yet
+            /*
+             * NCCL-001 Work Item 2: Completion timeout detection
+             *
+             * No completions returned. Check if this request has been pending
+             * longer than NCCL_MESH_TIMEOUT_SEC. A healthy RDMA operation
+             * completes in microseconds — if 30 seconds have passed, the link
+             * or QP is dead and no amount of waiting will fix it.
+             */
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long elapsed_sec = now.tv_sec - req->start_time.tv_sec;
+
+            if (elapsed_sec >= g_mesh_state.op_timeout_sec) {
+                const char *op_str = req->is_send ? "SEND" : "RECV";
+                uint32_t peer_ip = 0;
+                uint32_t qp_num = 0;
+                uint64_t conn_age = 0;
+
+                if (req->is_send && req->comm) {
+                    struct mesh_send_comm *sc = (struct mesh_send_comm *)req->comm;
+                    peer_ip = sc->peer_ip;
+                    qp_num = sc->qp ? sc->qp->qp_num : 0;
+                    conn_age = mesh_conn_age_sec(&sc->conn_established_time);
+                    // Mark peer as failed so subsequent ops fail fast
+                    __atomic_store_n(&sc->peer_failed, 1, __ATOMIC_RELEASE);
+                } else if (!req->is_send && req->comm) {
+                    struct mesh_recv_comm *rc = (struct mesh_recv_comm *)req->comm;
+                    peer_ip = rc->peer_ip;
+                    qp_num = rc->qp ? rc->qp->qp_num : 0;
+                    conn_age = mesh_conn_age_sec(&rc->conn_established_time);
+                    __atomic_store_n(&rc->peer_failed, 1, __ATOMIC_RELEASE);
+                }
+
+                MESH_ERROR_STRUCTURED(peer_ip, qp_num, op_str,
+                    "COMPLETION_TIMEOUT", conn_age,
+                    "Completion timeout after %lds — marking connection dead "
+                    "(expected_bytes=%zu, timeout=%ds)",
+                    elapsed_sec, req->size, g_mesh_state.op_timeout_sec);
+
+                if (g_mesh_state.fatal_on_timeout) {
+                    *done = 1;
+                    mesh_untrack_request(req);
+                    __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
+                    free(req);
+                    return ncclInternalError;
+                }
+            }
+
+            // No completions yet and no timeout - not done
             *done = 0;
             return ncclSuccess;
         }
@@ -3397,14 +3679,40 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
         // Got a completion - get the associated request
         struct mesh_request *completed_req = (struct mesh_request *)(uintptr_t)wc.wr_id;
 
-        // Check status
+        /*
+         * NCCL-001 Work Item 1: WC status checking with structured logging
+         *
+         * Inspect every Work Completion. Any status other than SUCCESS means
+         * the operation failed. Specific statuses indicate link-level failure:
+         * RETRY_EXC_ERR, RNR_RETRY_EXC_ERR, REM_ACCESS_ERR, REM_OP_ERR,
+         * WR_FLUSH_ERR (QP in error state).
+         */
         if (wc.status != IBV_WC_SUCCESS) {
-            // Log detailed error information
-            MESH_WARN("mesh_test: WC error: status=%d (%s) vendor_err=0x%x opcode=%d",
-                      wc.status, ibv_wc_status_str(wc.status), wc.vendor_err, wc.opcode);
+            const char *op_str = (completed_req && completed_req->is_send) ? "SEND" : "RECV";
+            uint32_t peer_ip = 0;
+            uint32_t qp_num = wc.qp_num;
+            uint64_t conn_age = 0;
 
-            // Check if this indicates peer failure
-            if (mesh_is_peer_failure(wc.status)) {
+            // Extract peer info for structured logging
+            if (completed_req && completed_req->comm) {
+                if (completed_req->is_send) {
+                    struct mesh_send_comm *sc = (struct mesh_send_comm *)completed_req->comm;
+                    peer_ip = sc->peer_ip;
+                    conn_age = mesh_conn_age_sec(&sc->conn_established_time);
+                } else {
+                    struct mesh_recv_comm *rc = (struct mesh_recv_comm *)completed_req->comm;
+                    peer_ip = rc->peer_ip;
+                    conn_age = mesh_conn_age_sec(&rc->conn_established_time);
+                }
+            }
+
+            MESH_ERROR_STRUCTURED(peer_ip, qp_num, op_str,
+                ibv_wc_status_str(wc.status), conn_age,
+                "vendor_err=0x%x opcode=%d — marking connection dead",
+                wc.vendor_err, wc.opcode);
+
+            // Check if this indicates peer failure (includes WR_FLUSH_ERR)
+            if (mesh_is_peer_failure(wc.status) || wc.status == IBV_WC_WR_FLUSH_ERR) {
                 mesh_mark_peer_failed(completed_req, wc.status);
             }
 
@@ -3421,7 +3729,7 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
                 __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
                 __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
                 free(req);  // TICKET-8: Free request on error completion
-                return ncclSystemError;
+                return ncclInternalError;
             }
 
             // Continue polling for other completions
@@ -3469,13 +3777,21 @@ static ncclResult_t mesh_closeSend(void *sendComm) {
         // TICKET-9: Free any outstanding requests to prevent memory leak
         // This handles the case where operations hang and comm is closed
         // before all operations complete (e.g., FSDP timeout during all-gather)
+        int outstanding = 0;
         for (int i = 0; i < comm->num_requests; i++) {
             struct mesh_request *req = comm->requests[i];
             if (req && !__atomic_load_n(&req->done, __ATOMIC_ACQUIRE)) {
+                outstanding++;
                 MESH_DEBUG("closeSend: freeing outstanding request %d", i);
                 __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
                 free(req);
             }
+        }
+        if (outstanding > 0) {
+            char ip_str[INET_ADDRSTRLEN];
+            mesh_uint_to_ip(comm->peer_ip, ip_str, sizeof(ip_str));
+            MESH_WARN("closeSend: freed %d outstanding requests for peer %s (QP %d)",
+                      outstanding, ip_str, comm->qp ? comm->qp->qp_num : 0);
         }
         comm->num_requests = 0;
 
@@ -3484,9 +3800,33 @@ static ncclResult_t mesh_closeSend(void *sendComm) {
             mesh_conn_pool_release(comm->pool_entry);
             // Don't destroy QP/CQ - they belong to the pool
         } else {
-            // Not pooled - destroy resources
-            if (comm->qp) ibv_destroy_qp(comm->qp);
-            if (comm->cq) ibv_destroy_cq(comm->cq);
+            /*
+             * NCCL-001 Work Item 6: Graceful connection teardown
+             *
+             * Transition QP to RESET state before destroying to drain pending
+             * operations. If the QP is in error state, ibv_destroy_qp may
+             * behave differently. RESET drains all pending WRs cleanly.
+             */
+            if (comm->qp) {
+                struct ibv_qp_attr attr;
+                memset(&attr, 0, sizeof(attr));
+                attr.qp_state = IBV_QPS_RESET;
+                int rc = ibv_modify_qp(comm->qp, &attr, IBV_QP_STATE);
+                if (rc != 0) {
+                    MESH_DEBUG("closeSend: QP RESET failed (errno=%d), "
+                               "proceeding with destroy", errno);
+                }
+                if (ibv_destroy_qp(comm->qp) != 0) {
+                    MESH_WARN("closeSend: ibv_destroy_qp failed: %s — "
+                              "continuing teardown", strerror(errno));
+                }
+            }
+            if (comm->cq) {
+                if (ibv_destroy_cq(comm->cq) != 0) {
+                    MESH_WARN("closeSend: ibv_destroy_cq failed: %s — "
+                              "continuing teardown", strerror(errno));
+                }
+            }
         }
         free(comm);
     }
@@ -3506,19 +3846,48 @@ static ncclResult_t mesh_closeRecv(void *recvComm) {
         // TICKET-9: Free any outstanding requests to prevent memory leak
         // This handles the case where operations hang and comm is closed
         // before all operations complete (e.g., FSDP timeout during all-gather)
+        int outstanding = 0;
         for (int i = 0; i < comm->num_requests; i++) {
             struct mesh_request *req = comm->requests[i];
             if (req && !__atomic_load_n(&req->done, __ATOMIC_ACQUIRE)) {
+                outstanding++;
                 MESH_DEBUG("closeRecv: freeing outstanding request %d", i);
                 __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
                 free(req);
             }
         }
+        if (outstanding > 0) {
+            char ip_str[INET_ADDRSTRLEN];
+            mesh_uint_to_ip(comm->peer_ip, ip_str, sizeof(ip_str));
+            MESH_WARN("closeRecv: freed %d outstanding requests for peer %s (QP %d)",
+                      outstanding, ip_str, comm->qp ? comm->qp->qp_num : 0);
+        }
         comm->num_requests = 0;
 
-        // QP/CQ are now owned by recv_comm, destroy them
-        if (comm->qp) ibv_destroy_qp(comm->qp);
-        if (comm->cq) ibv_destroy_cq(comm->cq);
+        /*
+         * NCCL-001 Work Item 6: Graceful connection teardown
+         * Transition QP to RESET state before destroying to drain pending operations.
+         */
+        if (comm->qp) {
+            struct ibv_qp_attr attr;
+            memset(&attr, 0, sizeof(attr));
+            attr.qp_state = IBV_QPS_RESET;
+            int rc = ibv_modify_qp(comm->qp, &attr, IBV_QP_STATE);
+            if (rc != 0) {
+                MESH_DEBUG("closeRecv: QP RESET failed (errno=%d), "
+                           "proceeding with destroy", errno);
+            }
+            if (ibv_destroy_qp(comm->qp) != 0) {
+                MESH_WARN("closeRecv: ibv_destroy_qp failed: %s — "
+                          "continuing teardown", strerror(errno));
+            }
+        }
+        if (comm->cq) {
+            if (ibv_destroy_cq(comm->cq) != 0) {
+                MESH_WARN("closeRecv: ibv_destroy_cq failed: %s — "
+                          "continuing teardown", strerror(errno));
+            }
+        }
         free(comm);
     }
 
@@ -3550,19 +3919,30 @@ static ncclResult_t mesh_closeListen(void *listenComm) {
         // Destroy mutex and condition
         pthread_mutex_destroy(&comm->queue_mutex);
         pthread_cond_destroy(&comm->queue_cond);
-        
-        // Clean up any remaining queue entries
+
+        // NCCL-001: Clean up any remaining queue entries with graceful QP teardown
         for (int i = 0; i < HANDSHAKE_QUEUE_SIZE; i++) {
             if (comm->handshake_queue[i].valid) {
-                if (comm->handshake_queue[i].local_qp) 
+                if (comm->handshake_queue[i].local_qp) {
+                    struct ibv_qp_attr attr;
+                    memset(&attr, 0, sizeof(attr));
+                    attr.qp_state = IBV_QPS_RESET;
+                    ibv_modify_qp(comm->handshake_queue[i].local_qp, &attr, IBV_QP_STATE);
                     ibv_destroy_qp(comm->handshake_queue[i].local_qp);
+                }
                 if (comm->handshake_queue[i].local_cq)
                     ibv_destroy_cq(comm->handshake_queue[i].local_cq);
             }
         }
-        
+
         for (int i = 0; i < comm->num_qps; i++) {
-            if (comm->qps[i].qp) ibv_destroy_qp(comm->qps[i].qp);
+            if (comm->qps[i].qp) {
+                struct ibv_qp_attr attr;
+                memset(&attr, 0, sizeof(attr));
+                attr.qp_state = IBV_QPS_RESET;
+                ibv_modify_qp(comm->qps[i].qp, &attr, IBV_QP_STATE);
+                ibv_destroy_qp(comm->qps[i].qp);
+            }
             if (comm->qps[i].cq) ibv_destroy_cq(comm->qps[i].cq);
         }
         free(comm);

@@ -9,6 +9,10 @@
 .vscode/
 .idea/
 
+# Test binaries
+tests/test_routing
+tests/test_error_paths
+
 # Debug files
 core
 *.core
