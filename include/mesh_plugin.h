@@ -9,7 +9,9 @@
 #define NCCL_MESH_PLUGIN_H
 
 #include <stdint.h>
+#include <stdatomic.h>
 #include <pthread.h>
+#include <time.h>
 #include <infiniband/verbs.h>
 
 #define MESH_MAX_NICS 8
@@ -175,9 +177,12 @@ struct mesh_send_comm {
     int last_wc_status;         // Last WC error status (for diagnostics)
     uint64_t error_count;       // Number of errors seen
 
+    // NCCL-001: Connection age tracking for structured error logging
+    struct timespec conn_established_time;  // When QP reached RTS
+    uint32_t peer_ip;           // Peer IP for pool lookup and error logging
+
     // Connection pooling (TICKET-6)
     struct mesh_conn_pool_entry *pool_entry;  // Pooled connection (if using pool)
-    uint32_t peer_ip;           // Peer IP for pool lookup
 
     // Async connect (TICKET-7)
     struct mesh_async_connect_req *async_req; // Pending async connect request
@@ -198,6 +203,10 @@ struct mesh_recv_comm {
     int peer_failed;            // Set when peer disconnect detected
     int last_wc_status;         // Last WC error status (for diagnostics)
     uint64_t error_count;       // Number of errors seen
+
+    // NCCL-001: Connection age and peer identity for structured error logging
+    struct timespec conn_established_time;  // When QP reached RTS
+    uint32_t peer_ip;           // Peer IP for error logging
 
     // Request tracking
     struct mesh_request *requests[MESH_MAX_QPS];
@@ -353,6 +362,7 @@ struct mesh_request {
     struct ibv_wc wc;
     void *comm;                 // Associated send/recv comm (for error propagation)
     int is_send;                // 1 if send request, 0 if recv
+    struct timespec start_time; // NCCL-001: Monotonic clock at request creation for timeout
 };
 
 /*
@@ -386,6 +396,20 @@ struct mesh_plugin_state {
 
     // Async connect state (TICKET-7)
     struct mesh_async_connect_state async_connect;
+
+    // NCCL-001: Error hardening configuration
+    int op_timeout_sec;             // NCCL_MESH_TIMEOUT_SEC: per-operation completion timeout (default: 30)
+    int connect_timeout_sec;        // NCCL_MESH_CONNECT_TIMEOUT_SEC: TCP handshake timeout (default: 10)
+    int accept_timeout_sec;         // NCCL_MESH_ACCEPT_TIMEOUT_SEC: accept queue wait timeout (default: 30)
+    int health_check_interval_ms;   // NCCL_MESH_HEALTH_CHECK_INTERVAL_MS: QP polling interval (default: 1000)
+    int fatal_on_timeout;           // NCCL_MESH_FATAL_ON_TIMEOUT: return error vs log-only (default: 1)
+
+    // NCCL-001: Async event monitoring thread
+    pthread_t async_event_thread;       // Monitors ibv_get_async_event on all device contexts
+    int async_event_thread_running;     // 1 if thread is active
+    int async_event_thread_stop;        // 1 to signal thread to stop
+    atomic_int plugin_fatal_error;      // Set by async event thread on catastrophic events
+    char fatal_error_msg[256];          // Description of fatal event for logging
 
     // TICKET-8: Request tracking for leak detection
     uint64_t requests_allocated;        // Total requests allocated
@@ -448,6 +472,10 @@ struct mesh_async_connect_req* mesh_async_connect_submit(struct mesh_handle *han
                                                           void *send_comm);
 int mesh_async_connect_poll(struct mesh_async_connect_req *req);
 
+// NCCL-001: Async event monitoring
+int mesh_async_event_init(void);
+void mesh_async_event_destroy(void);
+
 // TCP fallback operations (TICKET-4)
 int mesh_tcp_init(void);
 int mesh_tcp_listen(int dev, void *handle, void **listenComm);
@@ -488,5 +516,18 @@ const char* mesh_find_netdev_for_rdma(const char *rdma_dev);
 
 // MESH_TRACE: Alias for MESH_DEBUG (very verbose tracing)
 #define MESH_TRACE(fmt, ...) MESH_DEBUG(fmt, ##__VA_ARGS__)
+
+/*
+ * NCCL-001: Structured error logging for post-mortem analysis
+ * Every error includes: peer IP, QP number, operation type, status, connection age
+ */
+#define MESH_ERROR_STRUCTURED(peer_ip, qp_num, op_str, status_str, conn_age_sec, fmt, ...) \
+    do { \
+        char _ip_buf[16]; \
+        mesh_uint_to_ip(peer_ip, _ip_buf, sizeof(_ip_buf)); \
+        MESH_WARN("[MESH-PLUGIN ERROR] peer=%s qp=0x%x op=%s status=%s conn_age=%lus " fmt, \
+                  _ip_buf, (qp_num), (op_str), (status_str), \
+                  (unsigned long)(conn_age_sec), ##__VA_ARGS__); \
+    } while(0)
 
 #endif // NCCL_MESH_PLUGIN_H

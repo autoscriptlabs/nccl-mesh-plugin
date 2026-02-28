@@ -37,7 +37,7 @@ install: all
 
 # Clean
 clean:
-	rm -f $(OBJS) $(TARGET) $(TARGET_MESH) tests/test_routing
+	rm -f $(OBJS) $(TARGET) $(TARGET_MESH) tests/test_routing tests/test_error_paths
 
 # Test build (requires libibverbs-dev)
 test-deps:
@@ -68,23 +68,29 @@ TEST_LDFLAGS = -lpthread
 test_routing: tests/test_routing.c src/mesh_routing.c
 	$(CC) $(TEST_CFLAGS) $^ -o tests/$@ $(TEST_LDFLAGS)
 
+# Unit test for error paths (NCCL-001)
+test_error_paths: tests/test_error_paths.c
+	$(CC) $(TEST_CFLAGS) $^ -o tests/$@ $(TEST_LDFLAGS)
+
 # Run unit tests
-test: test_routing
+test: test_routing test_error_paths
 	@echo ""
 	@echo "Running unit tests..."
 	@./tests/test_routing
+	@./tests/test_error_paths
 	@echo ""
 	@echo "Running integration tests..."
 	@python3 tests/test_ring_topo.py
 	@python3 tests/test_line_topo.py
 
 # Run unit tests only (C)
-test-unit: test_routing
+test-unit: test_routing test_error_paths
 	@./tests/test_routing
+	@./tests/test_error_paths
 
 # Run integration tests only (Python)
 test-integration:
 	@python3 tests/test_ring_topo.py -v
 	@python3 tests/test_line_topo.py -v
 
-.PHONY: all clean install test-deps debug info test test_routing test-unit test-integration
+.PHONY: all clean install test-deps debug info test test_routing test_error_paths test-unit test-integration

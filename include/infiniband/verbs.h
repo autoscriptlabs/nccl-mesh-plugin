@@ -330,6 +330,40 @@ struct ibv_recv_wr {
     int num_sge;
 };
 
+/* Async event types (NCCL-001: for event monitoring) */
+enum ibv_event_type {
+    IBV_EVENT_CQ_ERR = 0,
+    IBV_EVENT_QP_FATAL = 1,
+    IBV_EVENT_QP_REQ_ERR = 2,
+    IBV_EVENT_QP_ACCESS_ERR = 3,
+    IBV_EVENT_COMM_EST = 4,
+    IBV_EVENT_SQ_DRAINED = 5,
+    IBV_EVENT_PATH_MIG = 6,
+    IBV_EVENT_PATH_MIG_ERR = 7,
+    IBV_EVENT_DEVICE_FATAL = 8,
+    IBV_EVENT_PORT_ACTIVE = 9,
+    IBV_EVENT_PORT_ERR = 10,
+    IBV_EVENT_LID_CHANGE = 11,
+    IBV_EVENT_PKEY_CHANGE = 12,
+    IBV_EVENT_SM_CHANGE = 13,
+    IBV_EVENT_SRQ_ERR = 14,
+    IBV_EVENT_SRQ_LIMIT_REACHED = 15,
+    IBV_EVENT_QP_LAST_WQE_REACHED = 16,
+    IBV_EVENT_CLIENT_REREGISTER = 17,
+    IBV_EVENT_GID_CHANGE = 18
+};
+
+/* Async event structure */
+struct ibv_async_event {
+    union {
+        struct ibv_cq *cq;
+        struct ibv_qp *qp;
+        struct ibv_srq *srq;
+        int port_num;
+    } element;
+    enum ibv_event_type event_type;
+};
+
 /* Opaque structs */
 struct ibv_context {
     struct ibv_device *device;
@@ -438,6 +472,38 @@ static inline int ibv_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr, struc
 }
 static inline const char *ibv_wc_status_str(enum ibv_wc_status status) {
     (void)status; return "stub_error";
+}
+
+/* NCCL-001: Async event monitoring stubs */
+static inline int ibv_get_async_event(struct ibv_context *ctx, struct ibv_async_event *event) {
+    (void)ctx; (void)event; return -1;
+}
+static inline void ibv_ack_async_event(struct ibv_async_event *event) { (void)event; }
+
+/* NCCL-001: Event type to string helper */
+static inline const char *ibv_event_type_str(enum ibv_event_type event_type) {
+    switch (event_type) {
+        case IBV_EVENT_CQ_ERR: return "IBV_EVENT_CQ_ERR";
+        case IBV_EVENT_QP_FATAL: return "IBV_EVENT_QP_FATAL";
+        case IBV_EVENT_QP_REQ_ERR: return "IBV_EVENT_QP_REQ_ERR";
+        case IBV_EVENT_QP_ACCESS_ERR: return "IBV_EVENT_QP_ACCESS_ERR";
+        case IBV_EVENT_COMM_EST: return "IBV_EVENT_COMM_EST";
+        case IBV_EVENT_SQ_DRAINED: return "IBV_EVENT_SQ_DRAINED";
+        case IBV_EVENT_PATH_MIG: return "IBV_EVENT_PATH_MIG";
+        case IBV_EVENT_PATH_MIG_ERR: return "IBV_EVENT_PATH_MIG_ERR";
+        case IBV_EVENT_DEVICE_FATAL: return "IBV_EVENT_DEVICE_FATAL";
+        case IBV_EVENT_PORT_ACTIVE: return "IBV_EVENT_PORT_ACTIVE";
+        case IBV_EVENT_PORT_ERR: return "IBV_EVENT_PORT_ERR";
+        case IBV_EVENT_LID_CHANGE: return "IBV_EVENT_LID_CHANGE";
+        case IBV_EVENT_PKEY_CHANGE: return "IBV_EVENT_PKEY_CHANGE";
+        case IBV_EVENT_SM_CHANGE: return "IBV_EVENT_SM_CHANGE";
+        case IBV_EVENT_SRQ_ERR: return "IBV_EVENT_SRQ_ERR";
+        case IBV_EVENT_SRQ_LIMIT_REACHED: return "IBV_EVENT_SRQ_LIMIT_REACHED";
+        case IBV_EVENT_QP_LAST_WQE_REACHED: return "IBV_EVENT_QP_LAST_WQE_REACHED";
+        case IBV_EVENT_CLIENT_REREGISTER: return "IBV_EVENT_CLIENT_REREGISTER";
+        case IBV_EVENT_GID_CHANGE: return "IBV_EVENT_GID_CHANGE";
+        default: return "UNKNOWN_EVENT";
+    }
 }
 
 #endif /* INFINIBAND_VERBS_H */
