@@ -5,10 +5,12 @@ Get distributed LLM training running on your direct-connect RDMA mesh in 15 minu
 ## Prerequisites
 
 - 3+ nodes with direct RDMA connections (ConnectX-7 NICs recommended)
-- Each node pair on a separate subnet (e.g., 192.168.100.x, 192.168.101.x, 192.168.102.x)
+- Each node pair on a separate subnet (e.g., 192.168.100.x, 192.168.101.x, etc.)
 - CUDA-capable GPUs (tested on DGX Spark with Grace Hopper)
 - Python 3.10+ with PyTorch, DeepSpeed, and Transformers installed
 - SLURM job scheduler (optional but recommended)
+
+**Reference cluster**: 4x DGX Spark in ring topology with 200Gbps QSFP56 links (ConnectX-7, dual-channel).
 
 ## Step 1: Build the Plugin
 
@@ -41,7 +43,7 @@ ib_send_bw -d rocep1s0f0 -x 3
 ib_send_bw -d rocep1s0f0 -x 3 192.168.101.3
 ```
 
-Expected: ~12 GB/s for 100GbE links.
+Expected: ~12 GB/s for 100GbE links, ~24 GB/s for 200GbE dual-channel links.
 
 ## Step 3: Configure Environment
 
@@ -91,15 +93,16 @@ print(f"Rank {rank} after: {tensor[0].item()}")  # Should be sum of all ranks
 dist.destroy_process_group()
 ```
 
-Run on 3 nodes:
+Run on your cluster (e.g., 4 nodes in ring topology):
 ```bash
 # Using SLURM
-srun -N3 --ntasks-per-node=1 python test_nccl.py
+srun -N4 --ntasks-per-node=1 python test_nccl.py
 
 # Or manually on each node
-# Node A: RANK=0 WORLD_SIZE=3 MASTER_ADDR=nodeA python test_nccl.py
-# Node B: RANK=1 WORLD_SIZE=3 MASTER_ADDR=nodeA python test_nccl.py
-# Node C: RANK=2 WORLD_SIZE=3 MASTER_ADDR=nodeA python test_nccl.py
+# Node A: RANK=0 WORLD_SIZE=4 MASTER_ADDR=nodeA python test_nccl.py
+# Node B: RANK=1 WORLD_SIZE=4 MASTER_ADDR=nodeA python test_nccl.py
+# Node C: RANK=2 WORLD_SIZE=4 MASTER_ADDR=nodeA python test_nccl.py
+# Node D: RANK=3 WORLD_SIZE=4 MASTER_ADDR=nodeA python test_nccl.py
 ```
 
 Look for `NET/Plugin: Loaded net plugin Mesh (v9)` in the output.
@@ -110,7 +113,7 @@ Look for `NET/Plugin: Loaded net plugin Mesh (v9)` in the output.
 
 ```bash
 # Allocate nodes interactively
-salloc -N3 --exclusive
+salloc -N4 --exclusive
 
 # Run training (100 steps for quick test)
 ./examples/run_qwen14b_deepspeed.sh --steps 100
@@ -159,7 +162,7 @@ The training script uses DeepSpeed ZeRO-3 with:
 - **Gradient checkpointing**: Recompute activations to save memory
 - **BF16 training**: Mixed precision with bfloat16
 
-Memory usage for Qwen2.5-14B across 3 nodes: ~38GB allocated per node.
+Memory usage for Qwen2.5-14B across 4 nodes: ~29GB allocated per node (less per-node with 4-way sharding vs 3-way).
 
 ## Troubleshooting
 
@@ -199,11 +202,23 @@ FATAL: Kernel requirements sm80-sm100 not met by sm121
 - Reduce `batch_size` (already at 1)
 - Enable CPU offloading in DeepSpeed config (slower but uses less GPU memory)
 
+## Using with vLLM
+
+The plugin supports vLLM for distributed inference, but vLLM has a race condition in its NCCL initialization that causes hangs with custom network plugins. Apply the included patch:
+
+```bash
+cd /path/to/vllm
+git apply /path/to/nccl-mesh-plugin/patches/ticket-f-vllm-nccl-init-barrier.patch
+export VLLM_NCCL_INIT_DELAY=2.0
+```
+
+See the main [README](README.md#vllm-support) for details.
+
 ## What's Next?
 
-- **Add more nodes**: Update hostfile and SLURM config for 4+ nodes
+- **Scale up**: Ring topology supports 4+ nodes with only 2 NICs each
 - **Train larger models**: 32B models work with 4 nodes, 70B needs 6-8 nodes
+- **Run inference**: Use vLLM with the included upstream patch
 - **Custom datasets**: Modify `SimpleDataset` class in training script
-- **Save checkpoints**: Add checkpoint saving to training loop
 
 See [docs/SETUP.md](docs/SETUP.md) for detailed hardware setup and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for plugin internals.

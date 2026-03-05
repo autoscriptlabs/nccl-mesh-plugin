@@ -1,8 +1,13 @@
 # NCCL Mesh Plugin Benchmark Results
 
+> **Note:** These benchmarks were collected on the original 3-node triangle mesh with 100Gbps single-channel links. The cluster has since been upgraded to a **4-node ring topology with 200Gbps QSFP56 dual-channel links**. Updated benchmarks are pending.
+
+## 3-Node Triangle Mesh (100Gbps, January 2026)
+
 - **World Size:** 3
 - **Device:** NVIDIA GB10
 - **Date:** 2026-01-09
+- **Link Speed:** 100 Gbps (single channel per ConnectX-7 port)
 
 ## Allreduce
 
