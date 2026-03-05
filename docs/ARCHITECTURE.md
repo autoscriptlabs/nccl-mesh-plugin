@@ -401,16 +401,16 @@ Relay nodes receive data, check the header, and forward to the next hop.
 
 ### Current Bottlenecks
 
-1. **Single Channel per Port**: ConnectX-7 ports have 2x PCIe 5.0 x4 lanes; we currently use only one (100Gbps instead of 200Gbps)
-2. **Single QP**: One Queue Pair per connection limits parallelism
-3. **Completion Signaling**: Every operation signals completion
-4. **Store-and-Forward Relay**: Adds ~1 RTT latency per hop
+1. **Single QP**: One Queue Pair per connection limits parallelism
+2. **Completion Signaling**: Every operation signals completion
+3. **Store-and-Forward Relay**: Adds ~1 RTT latency per hop for non-adjacent nodes
 
 ### Achieved Performance
 
-- **8+ GB/s** effective bandwidth (direct connections)
-- **~64%** of 100 Gbps line rate (single channel)
-- Sufficient for distributed ML workloads
+- **200 Gbps** link speed per QSFP56 cable (ConnectX-7, dual PCIe 5.0 x4 channels)
+- **8+ GB/s** effective bandwidth measured on earlier 100Gbps config (~64% utilization)
+- Working relay routing for non-adjacent nodes in ring/line topologies
+- Sufficient for distributed ML training (DeepSpeed ZeRO-3) and inference (vLLM)
 
 ### Implemented Optimizations
 
@@ -428,12 +428,6 @@ Reduce relay latency by forwarding packets as they arrive:
 - Don't wait for complete message before forwarding
 - Pipeline-friendly for large transfers
 
-#### Dual-Channel Per Port (200Gbps)
-ConnectX-7 ports expose two independent PCIe 5.0 x4 lanes:
-- Create QP pairs (one per channel) for each connection
-- Stripe data across both channels
-- Doubles effective bandwidth: 100Gbps → 200Gbps per cable
-
 #### Additional Optimizations
 1. **Multi-QP**: Multiple QPs per connection for parallelism
 2. **Selective Signaling**: Signal every N operations to reduce CQ overhead
@@ -444,7 +438,7 @@ ConnectX-7 ports expose two independent PCIe 5.0 x4 lanes:
 ```
 nccl-mesh-plugin/
 ├── src/
-│   ├── mesh_plugin.c      # Main plugin implementation (~3400 lines)
+│   ├── mesh_plugin.c      # Main plugin implementation (~4400 lines)
 │   └── mesh_routing.c     # Routing and relay layer (~3100 lines)
 ├── include/
 │   ├── mesh_plugin.h      # Plugin data structures
@@ -453,12 +447,16 @@ nccl-mesh-plugin/
 │   ├── test_routing.c     # Unit tests for routing (13 tests)
 │   ├── test_ring_topo.py  # Ring topology integration tests
 │   └── test_line_topo.py  # Line topology integration tests
+├── patches/
+│   └── ticket-f-vllm-nccl-init-barrier.patch  # vLLM upstream fix
 ├── nccl/
 │   ├── net.h              # NCCL net plugin interface
 │   ├── net_v8.h           # v8 properties structure
 │   └── err.h              # NCCL error codes
 ├── docs/
-│   └── PARTIAL_MESH_ROUTING_PLAN.md  # Implementation plan
+│   ├── ARCHITECTURE.md    # This file
+│   ├── SETUP.md           # Hardware setup guide
+│   └── PARTIAL_MESH_ROUTING_PLAN.md  # Routing implementation plan
 └── Makefile
 ```
 

@@ -6,18 +6,18 @@ This guide covers setting up a direct-connect RDMA mesh topology with multiple n
 
 Our reference setup uses NVIDIA DGX Spark workstations (Grace Hopper architecture with unified memory) connected via direct RDMA cables. The supported topology options are:
 
-- **3 nodes**: Triangle mesh (fully connected) - each node directly connected to all others
-- **4+ nodes ring**: Ring topology - each node connects to 2 neighbors, relay routing for non-adjacent
-- **Any nodes line**: Line topology - chain of nodes, relay routing for multi-hop
+- **3 nodes**: Triangle mesh (fully connected) — each node directly connected to all others
+- **4+ nodes ring**: Ring topology — each node connects to 2 neighbors, relay routing for non-adjacent
+- **Any nodes line**: Line topology — chain of nodes, relay routing for multi-hop
 
-Each ConnectX-7 port supports up to **200 Gbps** via dual PCIe 5.0 x4 channels, though current software uses single-channel mode (100 Gbps per link).
+Each ConnectX-7 port provides **200 Gbps** via dual PCIe 5.0 x4 channels using QSFP56 cables.
 
-**New in v2.0**: The plugin now supports partial mesh topologies with automatic relay routing. Non-adjacent nodes communicate through intermediate relay nodes.
+**Current production cluster**: 4x DGX Spark in a ring topology with 200Gbps links and automatic relay routing for non-adjacent nodes.
 
 ## Hardware Requirements
 
-- 3-4 nodes with RDMA-capable NICs (ConnectX-7 recommended for dual-channel support)
-- Direct-attach cables (QSFP56/QSFP112 for 100/200GbE)
+- 3+ nodes with RDMA-capable NICs (ConnectX-7 recommended)
+- QSFP56 direct-attach cables (200Gbps per link)
 - For triangle mesh: Each node needs 2 NICs
 - For ring topology: Each node needs 2 NICs
 
@@ -139,7 +139,7 @@ ib_send_bw -d rocep1s0f0 -x 3
 ib_send_bw -d rocep1s0f0 -x 3 192.168.101.3
 ```
 
-Expected output: ~12 GB/s for 100GbE
+Expected output: ~24 GB/s for 200GbE (dual-channel), ~12 GB/s for 100GbE (single-channel)
 
 ### 3. Verify GID Index
 
@@ -333,12 +333,15 @@ Node A ---- Node B ---- Node C ---- Node D
 
 Endpoints (A and D) have only 1 NIC; middle nodes need 2 NICs.
 
-## Reference: DGX Spark Mesh
+## Reference: DGX Spark Ring Cluster
 
-Our tested configuration:
+Our production configuration (4-node ring, 200Gbps QSFP56 links):
 
-| Hostname | Management IP | Mesh IPs |
-|----------|--------------|----------|
-| titanic (A) | 10.0.0.170 | 192.168.100.2, 192.168.101.2 |
-| iceberg (B) | 10.0.0.171 | 192.168.101.3, 192.168.102.2 |
-| carpathia (C) | 10.0.0.172 | 192.168.100.3, 192.168.102.3 |
+| Hostname | Management IP | Mesh IPs | Ring Neighbors |
+|----------|--------------|----------|----------------|
+| titanic (A) | 10.0.0.170 | 192.168.100.3, 192.168.101.2 | D ↔ A ↔ B |
+| iceberg (B) | 10.0.0.171 | 192.168.101.3, 192.168.102.2 | A ↔ B ↔ C |
+| carpathia (C) | 10.0.0.172 | 192.168.102.3, 192.168.103.2 | B ↔ C ↔ D |
+| water (D) | 10.0.0.173 | 192.168.103.3, 192.168.100.2 | C ↔ D ↔ A |
+
+Non-adjacent pairs (A↔C, B↔D) communicate via automatic relay routing through their neighbors.

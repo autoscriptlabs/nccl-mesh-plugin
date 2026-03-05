@@ -13,7 +13,7 @@ This plugin enables NCCL (NVIDIA Collective Communications Library) to work with
 - **Ring** (4+ nodes): Each node connects to 2 neighbors, relay routing for non-adjacent
 - **Line** (any number): Chain of nodes, relay routing for multi-hop communication
 
-**Tested configuration**: 3x DGX Spark workstations with 100Gbps direct RDMA links, running distributed LLM training (Qwen2.5-14B) with DeepSpeed ZeRO-3.
+**Current production configuration**: 4x DGX Spark workstations in a ring topology with **200Gbps** QSFP56 direct RDMA links (ConnectX-7, dual-channel), running distributed LLM training (Qwen2.5-14B) with DeepSpeed ZeRO-3. Also supports vLLM inference (with [upstream patches](#vllm-support)).
 
 ## Quick Start
 
@@ -28,7 +28,7 @@ export NCCL_NET_PLUGIN=$(pwd)/libnccl-net.so
 export NCCL_SOCKET_IFNAME=eth0  # Your management network interface
 
 # 3. Run distributed training (with SLURM)
-salloc -N3 --exclusive ./examples/run_qwen14b_deepspeed.sh --steps 100
+salloc -N4 --exclusive ./examples/run_qwen14b_deepspeed.sh --steps 100
 ```
 
 See [QUICKSTART.md](QUICKSTART.md) for detailed setup instructions.
@@ -36,38 +36,39 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed setup instructions.
 ## The Problem We Solved
 
 ```
-                    +-----------+
-                    |  Node A   |
-                    | (spark-a) |
-                    +-----+-----+
-           192.168.101.x  |  192.168.100.x
-              (100Gbps)   |     (100Gbps)
-                    +-----+-----+
-                    |           |
-              +-----+-----+ +---+-------+
-              |  Node B   | |  Node C   |
-              | (spark-b) | | (spark-c) |
-              +-----+-----+ +-----+-----+
-                    |             |
-                    +------+------+
-                    192.168.102.x
-                      (100Gbps)
+        Node A (titanic)
+       /      \
+   200Gbps    200Gbps
+   QSFP56     QSFP56
+     /          \
+  Node B        Node D
+(iceberg)    (carpathia-2)
+     \          /
+   200Gbps    200Gbps
+   QSFP56     QSFP56
+     \          /
+      \        /
+       Node C
+    (carpathia)
 ```
 
-**Three DGX Spark workstations** connected in a triangle mesh with direct 100Gbps RDMA cables. Each link is on a **different subnet** - a configuration not covered by standard NCCL network plugins.
+**Four DGX Spark workstations** in a ring topology with direct **200Gbps** QSFP56 RDMA cables (ConnectX-7, dual PCIe 5.0 x4 channels). Each link is on a **different subnet** — a configuration not covered by standard NCCL network plugins. Non-adjacent nodes (A↔C, B↔D) communicate via automatic relay routing through their neighbors.
 
 ## Performance
 
 | Metric | Value |
 |--------|-------|
-| Effective Bandwidth | **8+ GB/s** |
-| Line Rate Utilization | ~64% |
-| Topology | 3-node triangle mesh |
-| Link Speed | 100 Gbps per link |
+| Effective Bandwidth | **8+ GB/s** (direct), relay adds ~1 RTT/hop |
+| Line Rate Utilization | ~64% of single channel* |
+| Topology | 4-node ring (production) |
+| Link Speed | **200 Gbps** per link (QSFP56, dual-channel) |
+| Peak AllReduce | 16.93 GB/s (1000 MB messages) |
+
+*Benchmarks measured on earlier 100Gbps single-channel config. 200Gbps dual-channel numbers pending.
 
 ## LLM Training Example
 
-This plugin was developed for distributed LLM training. Here's how to train Qwen2.5-14B across 3 nodes:
+This plugin was developed for distributed LLM training. Here's how to train Qwen2.5-14B across 4 nodes:
 
 ### Prerequisites
 
@@ -80,7 +81,7 @@ This plugin was developed for distributed LLM training. Here's how to train Qwen
 
 **Interactive (for testing):**
 ```bash
-salloc -N3 --exclusive
+salloc -N4 --exclusive
 ./examples/run_qwen14b_deepspeed.sh --steps 100
 ```
 
@@ -98,7 +99,7 @@ tail -f training_<jobid>.log
 
 ### Memory Usage
 
-With DeepSpeed ZeRO-3 on 3 nodes (117GB unified memory each):
+With DeepSpeed ZeRO-3 on 4 nodes (117GB unified memory each):
 
 | Component | Per-Node Memory |
 |-----------|-----------------|
@@ -239,11 +240,14 @@ nccl-mesh-plugin/
 |   +-- submit_training.sbatch       # SLURM batch submission
 |   +-- test_allreduce.py            # Basic communication test
 |   +-- benchmark_bandwidth.py       # Bandwidth benchmark
++-- patches/
+|   +-- ticket-f-vllm-nccl-init-barrier.patch  # vLLM upstream fix
 +-- docs/
 |   +-- ARCHITECTURE.md              # Deep dive into implementation
 |   +-- SETUP.md                     # Hardware setup guide
 |   +-- PARTIAL_MESH_ROUTING_PLAN.md # Routing implementation plan
 +-- QUICKSTART.md              # Step-by-step getting started
++-- BENCHMARKS.md              # Performance measurements
 +-- Makefile
 ```
 
@@ -283,9 +287,24 @@ cat /sys/class/infiniband/*/ports/1/gids/*
 
 ## Limitations
 
-- **Single channel per port**: Uses 100Gbps, not full 200Gbps per ConnectX-7 port
 - **RoCE v2 only**: No InfiniBand fabric support
-- **Store-and-forward relay**: Adds latency for multi-hop (cut-through planned)
+- **Store-and-forward relay**: Adds ~1 RTT latency per hop for non-adjacent nodes (cut-through planned)
+- **vLLM requires upstream patches**: See [vLLM Support](#vllm-support) below
+
+## vLLM Support
+
+The plugin works with vLLM for distributed inference, but requires a small upstream patch to fix a race condition in NCCL communicator initialization. The patch adds a barrier + configurable delay between `torch.distributed.init_process_group()` and NCCL communicator creation, giving the mesh plugin time to complete RDMA setup.
+
+Apply the patch (included in `patches/`):
+```bash
+cd /path/to/vllm
+git apply /path/to/nccl-mesh-plugin/patches/ticket-f-vllm-nccl-init-barrier.patch
+
+# Then run vLLM with the delay
+export VLLM_NCCL_INIT_DELAY=2.0  # seconds
+```
+
+This patch has been submitted upstream but is not yet merged. See the patch file for details on the two modified files (`vllm/distributed/parallel_state.py` and `vllm/envs.py`).
 
 ## Roadmap
 
@@ -294,10 +313,15 @@ cat /sys/class/infiniband/*/ports/1/gids/*
 - [x] Relay routing for non-adjacent nodes
 - [x] Automatic topology detection
 - [x] Dual-path routing with load balancing (ring)
+- [x] Dual-channel per port (200Gbps QSFP56)
+- [x] vLLM support (with upstream patch)
+- [x] ARM64/AArch64 memory ordering fixes
+- [x] Blackwell PCIe topology / NIC classification support
+- [x] Automatic GID index discovery (4+ nodes)
+- [x] Server metrics logging for transport stall diagnosis
+- [x] Hardened error paths (eliminate silent hangs)
 - [ ] Cut-through forwarding (reduce relay latency)
-- [ ] Dual-channel per port (200Gbps)
 - [ ] Multi-QP aggregation
-- [ ] Checkpoint saving in training scripts
 
 ## Documentation
 
@@ -311,4 +335,4 @@ MIT License - see [LICENSE](LICENSE) file.
 
 ## Acknowledgments
 
-Built to connect DGX Spark workstations in ways that go beyond standard configurations.
+Built to connect DGX Spark workstations in ways that go beyond standard configurations. Currently running a 4-node ring cluster with 200Gbps links for distributed LLM training and inference.
