@@ -342,6 +342,6 @@ Our production configuration (4-node ring, 200Gbps QSFP56 links):
 | titanic (A) | 10.0.0.170 | 192.168.100.3, 192.168.101.2 | D ↔ A ↔ B |
 | iceberg (B) | 10.0.0.171 | 192.168.101.3, 192.168.102.2 | A ↔ B ↔ C |
 | carpathia (C) | 10.0.0.172 | 192.168.102.3, 192.168.103.2 | B ↔ C ↔ D |
-| carpathia-2 (D) | 10.0.0.173 | 192.168.103.3, 192.168.100.2 | C ↔ D ↔ A |
+| water (D) | 10.0.0.173 | 192.168.103.3, 192.168.100.2 | C ↔ D ↔ A |
 
 Non-adjacent pairs (A↔C, B↔D) communicate via automatic relay routing through their neighbors.
