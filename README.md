@@ -42,7 +42,7 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed setup instructions.
    QSFP56     QSFP56
      /          \
   Node B        Node D
-(iceberg)    (carpathia-2)
+(iceberg)    (water)
      \          /
    200Gbps    200Gbps
    QSFP56     QSFP56
