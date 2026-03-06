@@ -340,3 +340,5 @@ Built to connect DGX Spark workstations in ways that go beyond standard configur
 ## Services
 
 Need help integrating the plugin into your stack? Making it play nice? Open to engagements at standard consulting rates: autoscriptlabs@gmail.com
+
+Note: Due to US export control regulations, I'm unable to provide services to entities in embargoed or Country Group D:5 destinations.
