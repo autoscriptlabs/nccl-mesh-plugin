@@ -336,3 +336,7 @@ MIT License - see [LICENSE](LICENSE) file.
 ## Acknowledgments
 
 Built to connect DGX Spark workstations in ways that go beyond standard configurations. Currently running a 4-node ring cluster with 200Gbps links for distributed LLM training and inference.
+
+## Services
+
+Need help integrating the plugin into your stack? Making it play nice? Open to engagements at standard consulting rates: autoscriptlabs@gmail.com
