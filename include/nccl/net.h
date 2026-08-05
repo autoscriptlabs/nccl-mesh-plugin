@@ -41,7 +41,12 @@ typedef void* ncclNetDeviceHandle_t;
 #define NCCL_NET_MAX_REQUESTS 32
 
 /* Maximum net size */
-#define NCCL_MAX_NET_SIZE_BYTES (1ULL << 31)
+#define NCCL_MAX_NET_SIZE_BYTES (1ULL << 40)  /* 1 TiB */
+
+/* Pointer types used by NCCL network plugins */
+#define NCCL_PTR_HOST   0x1
+#define NCCL_PTR_CUDA   0x2
+#define NCCL_PTR_DMABUF 0x4
 
 /* Device version */
 #define NCCL_NET_DEVICE_INVALID_VERSION 0
@@ -52,25 +57,27 @@ typedef enum {
     NCCL_NET_DEVICE_UNPACK = 1
 } ncclNetDeviceType;
 
-/* Net properties v8 */
+/* Net properties v8 — ABI-compatible with NCCL's net_v8.h */
 typedef struct {
-    char name[256];
-    char pciPath[256];
+    char* name;
+    char* pciPath;
     uint64_t guid;
     int ptrSupport;
+    int regIsGlobal;
     int speed;
     int port;
+    float latency;
     int maxComms;
     int maxRecvs;
-    int latency;
-    int netDeviceType;
+    ncclNetDeviceType netDeviceType;
     int netDeviceVersion;
 } ncclNetProperties_v8_t;
 
 /* Virtual device properties for v9 */
+#define NCCL_NET_MAX_DEVS_PER_NIC_V11 4
 typedef struct {
     int ndevs;
-    int* devs;
+    int devs[NCCL_NET_MAX_DEVS_PER_NIC_V11];
 } ncclNetVDeviceProps_v9_t;
 
 /* Net properties v9 */
