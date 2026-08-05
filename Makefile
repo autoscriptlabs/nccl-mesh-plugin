@@ -45,7 +45,7 @@ install: all
 
 # Clean
 clean:
-	rm -f $(OBJS) $(TARGET) $(TARGET_MESH) tests/test_routing tests/test_error_paths
+	rm -f $(OBJS) $(TARGET) $(TARGET_MESH) tests/test_routing tests/test_error_paths tests/test_object_dispatch
 
 # Test build (requires libibverbs-dev)
 test-deps:
@@ -71,7 +71,7 @@ info:
 
 # Test flags (no -fPIC, add pthread)
 TEST_CFLAGS = -Wall -Wextra -O2 -g -I. -iquote ./include $(IBVERBS_CFLAGS)
-TEST_LDFLAGS = -lpthread
+TEST_LDFLAGS = $(IBVERBS_LIBS) -lpthread
 
 # Unit test for routing
 test_routing: tests/test_routing.c src/mesh_routing.c
@@ -81,25 +81,31 @@ test_routing: tests/test_routing.c src/mesh_routing.c
 test_error_paths: tests/test_error_paths.c
 	$(CC) $(TEST_CFLAGS) $^ -o tests/$@ $(TEST_LDFLAGS)
 
+# Unit test for typed NCCL opaque objects (Gate 1)
+test_object_dispatch: tests/test_object_dispatch.c
+	$(CC) $(TEST_CFLAGS) $^ -o tests/$@ $(TEST_LDFLAGS)
+
 # Run unit tests
-test: test_routing test_error_paths
+test: test_routing test_error_paths test_object_dispatch
 	@echo ""
 	@echo "Running unit tests..."
 	@./tests/test_routing
 	@./tests/test_error_paths
+	@./tests/test_object_dispatch
 	@echo ""
 	@echo "Running integration tests..."
 	@python3 tests/test_ring_topo.py
 	@python3 tests/test_line_topo.py
 
 # Run unit tests only (C)
-test-unit: test_routing test_error_paths
+test-unit: test_routing test_error_paths test_object_dispatch
 	@./tests/test_routing
 	@./tests/test_error_paths
+	@./tests/test_object_dispatch
 
 # Run integration tests only (Python)
 test-integration:
 	@python3 tests/test_ring_topo.py -v
 	@python3 tests/test_line_topo.py -v
 
-.PHONY: all clean install test-deps debug info test test_routing test_error_paths test-unit test-integration
+.PHONY: all clean install test-deps debug info test test_routing test_error_paths test_object_dispatch test-unit test-integration

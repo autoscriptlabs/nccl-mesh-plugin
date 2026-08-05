@@ -23,6 +23,102 @@
 #define MESH_CONN_POOL_SIZE 64        // Max pooled connections per NIC
 #define MESH_ASYNC_QUEUE_SIZE 32      // Pending async connect requests
 
+
+/*
+ * Common typed-object prefix
+ *
+ * NCCL exposes comms, requests, and memory registrations as opaque pointers.
+ * Every object returned to NCCL must begin with this immutable prefix so the
+ * callbacks can dispatch per object rather than through a process-global mode.
+ */
+#define MESH_OBJECT_MAGIC   0x4D4F424AU  /* "MOBJ" */
+#define MESH_OBJECT_VERSION 1U
+
+enum mesh_object_kind {
+    MESH_OBJ_INVALID = 0,
+
+    MESH_OBJ_LISTEN_RDMA,
+    MESH_OBJ_LISTEN_TCP,
+
+    MESH_OBJ_SEND_RDMA,
+    MESH_OBJ_RECV_RDMA,
+    MESH_OBJ_SEND_TCP,
+    MESH_OBJ_RECV_TCP,
+    MESH_OBJ_SEND_RELAY,
+    MESH_OBJ_RECV_RELAY,
+
+    MESH_OBJ_REQ_RDMA_SEND,
+    MESH_OBJ_REQ_RDMA_RECV,
+    MESH_OBJ_REQ_TCP_SEND,
+    MESH_OBJ_REQ_TCP_RECV,
+    MESH_OBJ_REQ_RELAY_SEND,
+    MESH_OBJ_REQ_RELAY_RECV,
+
+    MESH_OBJ_MR_RDMA,
+    MESH_OBJ_MR_TCP,
+    MESH_OBJ_MR_RELAY,
+};
+
+struct mesh_object_header {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t kind;
+};
+
+enum mesh_request_state {
+    MESH_REQ_PENDING = 0,
+    MESH_REQ_FINALIZING,
+    MESH_REQ_COMPLETE,
+    MESH_REQ_ERROR,
+    MESH_REQ_CANCELLED,
+};
+
+struct mesh_request_header {
+    struct mesh_object_header object;
+    atomic_int state;
+    int result;  /* Stores a terminal ncclResult_t value without header coupling. */
+    size_t completed_size;
+};
+
+static inline void mesh_object_init(struct mesh_object_header *header,
+                                    enum mesh_object_kind kind) {
+    header->magic = MESH_OBJECT_MAGIC;
+    header->version = MESH_OBJECT_VERSION;
+    header->kind = (uint16_t)kind;
+}
+
+static inline enum mesh_object_kind mesh_object_kind_of(const void *object) {
+    const struct mesh_object_header *header =
+        (const struct mesh_object_header *)object;
+
+    if (!header ||
+        header->magic != MESH_OBJECT_MAGIC ||
+        header->version != MESH_OBJECT_VERSION) {
+        return MESH_OBJ_INVALID;
+    }
+
+    return (enum mesh_object_kind)header->kind;
+}
+
+static inline int mesh_object_is(const void *object,
+                                 enum mesh_object_kind expected) {
+    return mesh_object_kind_of(object) == expected;
+}
+
+static inline void mesh_request_header_init(struct mesh_request_header *header,
+                                            enum mesh_object_kind kind) {
+    mesh_object_init(&header->object, kind);
+    atomic_init(&header->state, MESH_REQ_PENDING);
+    header->result = 0;  /* ncclSuccess */
+    header->completed_size = 0;
+}
+
+static inline int mesh_request_state_is_terminal(int state) {
+    return state == MESH_REQ_COMPLETE ||
+           state == MESH_REQ_ERROR ||
+           state == MESH_REQ_CANCELLED;
+}
+
 // Forward declarations
 struct mesh_plugin_state;
 struct mesh_nic;
@@ -147,6 +243,7 @@ struct handshake_entry {
 };
 
 struct mesh_listen_comm {
+    struct mesh_object_header object;
     int num_qps;
     struct {
         struct mesh_nic *nic;
@@ -178,6 +275,7 @@ struct mesh_listen_comm {
  * Send/Receive communication state
  */
 struct mesh_send_comm {
+    struct mesh_object_header object;
     struct mesh_nic *nic;
     struct ibv_qp *qp;
     struct ibv_cq *cq;
@@ -207,6 +305,7 @@ struct mesh_send_comm {
 };
 
 struct mesh_recv_comm {
+    struct mesh_object_header object;
     struct mesh_nic *nic;
     struct ibv_qp *qp;
     struct ibv_cq *cq;
@@ -230,6 +329,7 @@ struct mesh_recv_comm {
  * Memory registration handle
  */
 struct mesh_mr_handle {
+    struct mesh_object_header object;
     struct ibv_mr *mr;
     struct mesh_nic *nic;
     void *addr;
@@ -243,6 +343,7 @@ struct mesh_mr_handle {
  * Used when RDMA/IB setup fails or is disabled
  */
 struct mesh_tcp_listen_comm {
+    struct mesh_object_header object;
     int listen_sock;            // TCP listening socket
     uint16_t listen_port;       // Port we're listening on
     uint32_t listen_ip;         // IP we're bound to (INADDR_ANY typically)
@@ -250,6 +351,7 @@ struct mesh_tcp_listen_comm {
 };
 
 struct mesh_tcp_send_comm {
+    struct mesh_object_header object;
     int sock;                   // Connected TCP socket
     uint32_t remote_ip;         // Remote peer IP
     uint16_t remote_port;       // Remote peer port
@@ -270,6 +372,7 @@ struct mesh_tcp_send_comm {
 };
 
 struct mesh_tcp_recv_comm {
+    struct mesh_object_header object;
     int sock;                   // Connected TCP socket
     uint32_t remote_ip;         // Remote peer IP
     int connected;
@@ -289,6 +392,7 @@ struct mesh_tcp_recv_comm {
 };
 
 struct mesh_tcp_request {
+    struct mesh_request_header header;
     int used;
     int done;
     size_t size;
@@ -368,6 +472,7 @@ struct mesh_async_connect_state {
  * Async request state
  */
 struct mesh_request {
+    struct mesh_request_header header;
     int used;
     int done;
     size_t size;
@@ -377,6 +482,27 @@ struct mesh_request {
     int is_send;                // 1 if send request, 0 if recv
     struct timespec start_time; // NCCL-001: Monotonic clock at request creation for timeout
 };
+
+
+/* NCCL opaque-object dispatch depends on every prefix remaining at offset zero. */
+_Static_assert(offsetof(struct mesh_listen_comm, object) == 0,
+               "mesh_listen_comm object header must be first");
+_Static_assert(offsetof(struct mesh_send_comm, object) == 0,
+               "mesh_send_comm object header must be first");
+_Static_assert(offsetof(struct mesh_recv_comm, object) == 0,
+               "mesh_recv_comm object header must be first");
+_Static_assert(offsetof(struct mesh_tcp_listen_comm, object) == 0,
+               "mesh_tcp_listen_comm object header must be first");
+_Static_assert(offsetof(struct mesh_tcp_send_comm, object) == 0,
+               "mesh_tcp_send_comm object header must be first");
+_Static_assert(offsetof(struct mesh_tcp_recv_comm, object) == 0,
+               "mesh_tcp_recv_comm object header must be first");
+_Static_assert(offsetof(struct mesh_mr_handle, object) == 0,
+               "mesh_mr_handle object header must be first");
+_Static_assert(offsetof(struct mesh_request, header) == 0,
+               "mesh_request header must be first");
+_Static_assert(offsetof(struct mesh_tcp_request, header) == 0,
+               "mesh_tcp_request header must be first");
 
 /*
  * Global plugin state

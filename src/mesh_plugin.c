@@ -1666,6 +1666,7 @@ static ncclResult_t mesh_tcp_listen_impl(int dev, void *handle, void **listenCom
     if (!comm) {
         return ncclSystemError;
     }
+    mesh_object_init(&comm->object, MESH_OBJ_LISTEN_TCP);
 
     sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
@@ -1773,6 +1774,7 @@ static ncclResult_t mesh_tcp_connect_impl(int dev, void *opaqueHandle, void **se
     if (!comm) {
         return ncclSystemError;
     }
+    mesh_object_init(&comm->object, MESH_OBJ_SEND_TCP);
 
     // Create and connect socket
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -1863,6 +1865,7 @@ static ncclResult_t mesh_tcp_accept_impl(void *listenComm, void **recvComm,
     if (!comm) {
         return ncclSystemError;
     }
+    mesh_object_init(&comm->object, MESH_OBJ_RECV_TCP);
 
     // Set socket to non-blocking for timeout handling
     int flags = fcntl(lcomm->listen_sock, F_GETFL, 0);
@@ -1923,6 +1926,7 @@ static ncclResult_t mesh_tcp_regMr(void *comm, void *data, size_t size, int type
     if (!mrh) {
         return ncclSystemError;
     }
+    mesh_object_init(&mrh->object, MESH_OBJ_MR_TCP);
 
     mrh->mr = NULL;  // No RDMA MR in TCP mode
     mrh->nic = NULL;
@@ -1959,6 +1963,7 @@ static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag
     if (!req) {
         return ncclSystemError;
     }
+    mesh_request_header_init(&req->header, MESH_OBJ_REQ_TCP_SEND);
     __atomic_fetch_add(&g_mesh_state.tcp_requests_allocated, 1, __ATOMIC_RELAXED);
 
     req->used = 1;
@@ -2023,6 +2028,7 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
     if (!req) {
         return ncclSystemError;
     }
+    mesh_request_header_init(&req->header, MESH_OBJ_REQ_TCP_RECV);
     __atomic_fetch_add(&g_mesh_state.tcp_requests_allocated, 1, __ATOMIC_RELAXED);
 
     req->used = 1;
@@ -3050,6 +3056,7 @@ static ncclResult_t mesh_listen(int dev, void *handle, void **listenComm) {
     if (!comm) {
         return ncclSystemError;
     }
+    mesh_object_init(&comm->object, MESH_OBJ_LISTEN_RDMA);
     
     comm->num_qps = 0;
     comm->psn = 0;
@@ -3256,6 +3263,7 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
     if (!comm) {
         return ncclSystemError;
     }
+    mesh_object_init(&comm->object, MESH_OBJ_SEND_RDMA);
 
     comm->nic = nic;
     comm->peer_ip = peer_ip;
@@ -3390,9 +3398,14 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
 
 static ncclResult_t mesh_accept(void *listenComm, void **recvComm,
                                ncclNetDeviceHandle_t **recvDevComm) {
-    // Dispatch to TCP if in fallback mode (TICKET-4)
-    if (g_mesh_state.tcp_fallback_active) {
+    enum mesh_object_kind listen_kind = mesh_object_kind_of(listenComm);
+
+    if (listen_kind == MESH_OBJ_LISTEN_TCP) {
         return mesh_tcp_accept_impl(listenComm, recvComm, recvDevComm);
+    }
+    if (listen_kind != MESH_OBJ_LISTEN_RDMA) {
+        MESH_WARN("accept: invalid listen object kind %d", listen_kind);
+        return ncclInvalidArgument;
     }
 
     // NCCL-001: Check for fatal async event before accept
@@ -3409,6 +3422,7 @@ static ncclResult_t mesh_accept(void *listenComm, void **recvComm,
     if (!rcomm) {
         return ncclSystemError;
     }
+    mesh_object_init(&rcomm->object, MESH_OBJ_RECV_RDMA);
     
     // Wait for handshake from queue (filled by handshake thread)
     pthread_mutex_lock(&lcomm->queue_mutex);
@@ -3456,18 +3470,27 @@ static ncclResult_t mesh_accept(void *listenComm, void **recvComm,
 }
 
 static ncclResult_t mesh_regMr(void *comm, void *data, size_t size, int type, void **mhandle) {
-    // Dispatch to TCP if in fallback mode (TICKET-4)
-    if (g_mesh_state.tcp_fallback_active) {
-        return mesh_tcp_regMr(comm, data, size, type, mhandle);
-    }
-
-    struct mesh_send_comm *scomm = (struct mesh_send_comm *)comm;
+    enum mesh_object_kind comm_kind = mesh_object_kind_of(comm);
+    struct mesh_nic *nic = NULL;
     struct mesh_mr_handle *mrh;
     int access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
 
+    if (comm_kind == MESH_OBJ_SEND_TCP || comm_kind == MESH_OBJ_RECV_TCP) {
+        return mesh_tcp_regMr(comm, data, size, type, mhandle);
+    }
+
+    if (comm_kind == MESH_OBJ_SEND_RDMA) {
+        nic = ((struct mesh_send_comm *)comm)->nic;
+    } else if (comm_kind == MESH_OBJ_RECV_RDMA) {
+        nic = ((struct mesh_recv_comm *)comm)->nic;
+    } else {
+        MESH_WARN("regMr: invalid comm object kind %d", comm_kind);
+        return ncclInvalidArgument;
+    }
+
     MESH_DEBUG("regMr: comm=%p, data=%p, size=%zu, type=%d", comm, data, size, type);
 
-    if (!scomm || !scomm->nic || !scomm->nic->pd) {
+    if (!nic || !nic->pd) {
         MESH_WARN("regMr: invalid comm or nic");
         return ncclSystemError;
     }
@@ -3476,6 +3499,7 @@ static ncclResult_t mesh_regMr(void *comm, void *data, size_t size, int type, vo
     if (!mrh) {
         return ncclSystemError;
     }
+    mesh_object_init(&mrh->object, MESH_OBJ_MR_RDMA);
 
     /*
      * TICKET-C: Unified memory handling for Grace Blackwell
@@ -3496,7 +3520,7 @@ static ncclResult_t mesh_regMr(void *comm, void *data, size_t size, int type, vo
         MESH_DEBUG("regMr: detected CUDA managed/unified memory at %p", data);
     }
 
-    mrh->mr = ibv_reg_mr(scomm->nic->pd, data, size, access_flags);
+    mrh->mr = ibv_reg_mr(nic->pd, data, size, access_flags);
     if (!mrh->mr) {
         if (managed) {
             MESH_WARN("regMr: ibv_reg_mr failed on unified memory (%s) - "
@@ -3509,7 +3533,7 @@ static ncclResult_t mesh_regMr(void *comm, void *data, size_t size, int type, vo
         return ncclSystemError;
     }
 
-    mrh->nic = scomm->nic;
+    mrh->nic = nic;
     mrh->addr = data;
     mrh->size = size;
     mrh->is_managed = managed;
@@ -3527,22 +3551,38 @@ static ncclResult_t mesh_regMrDmaBuf(void *comm, void *data, size_t size, int ty
 }
 
 static ncclResult_t mesh_deregMr(void *comm, void *mhandle) {
-    (void)comm;  // unused - deregistration doesn't need comm
-    struct mesh_mr_handle *mrh = (struct mesh_mr_handle *)mhandle;
-    
-    if (mrh && mrh->mr) {
-        ibv_dereg_mr(mrh->mr);
+    (void)comm;  // Deregistration is owned by the typed memory handle.
+
+    if (!mhandle) {
+        return ncclSuccess;
     }
+
+    enum mesh_object_kind mr_kind = mesh_object_kind_of(mhandle);
+    struct mesh_mr_handle *mrh = (struct mesh_mr_handle *)mhandle;
+
+    if (mr_kind == MESH_OBJ_MR_RDMA) {
+        if (mrh->mr) {
+            ibv_dereg_mr(mrh->mr);
+        }
+    } else if (mr_kind != MESH_OBJ_MR_TCP) {
+        MESH_WARN("deregMr: invalid memory handle kind %d", mr_kind);
+        return ncclInvalidArgument;
+    }
+
     free(mrh);
-    
     return ncclSuccess;
 }
 
 static ncclResult_t mesh_isend(void *sendComm, void *data, int size, int tag,
                               void *mhandle, void **request) {
-    // Dispatch to TCP if in fallback mode (TICKET-4)
-    if (g_mesh_state.tcp_fallback_active) {
+    enum mesh_object_kind comm_kind = mesh_object_kind_of(sendComm);
+
+    if (comm_kind == MESH_OBJ_SEND_TCP) {
         return mesh_tcp_isend(sendComm, data, size, tag, mhandle, request);
+    }
+    if (comm_kind != MESH_OBJ_SEND_RDMA) {
+        MESH_WARN("isend: invalid send comm object kind %d", comm_kind);
+        return ncclInvalidArgument;
     }
 
     struct mesh_send_comm *comm = (struct mesh_send_comm *)sendComm;
@@ -3565,9 +3605,9 @@ static ncclResult_t mesh_isend(void *sendComm, void *data, int size, int tag,
         MESH_WARN("isend: invalid comm");
         return ncclSystemError;
     }
-    if (!mrh || !mrh->mr) {
-        MESH_WARN("isend: invalid mhandle");
-        return ncclSystemError;
+    if (!mrh || !mesh_object_is(mrh, MESH_OBJ_MR_RDMA) || !mrh->mr) {
+        MESH_WARN("isend: invalid RDMA mhandle");
+        return ncclInvalidArgument;
     }
 
     // Fast-fail if peer already known to be disconnected
@@ -3581,6 +3621,7 @@ static ncclResult_t mesh_isend(void *sendComm, void *data, int size, int tag,
     if (!req) {
         return ncclSystemError;
     }
+    mesh_request_header_init(&req->header, MESH_OBJ_REQ_RDMA_SEND);
     __atomic_fetch_add(&g_mesh_state.requests_allocated, 1, __ATOMIC_RELAXED);
 
     req->used = 1;
@@ -3632,9 +3673,14 @@ static ncclResult_t mesh_isend(void *sendComm, void *data, int size, int tag,
 
 static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
                               int *tags, void **mhandles, void **request) {
-    // Dispatch to TCP if in fallback mode (TICKET-4)
-    if (g_mesh_state.tcp_fallback_active) {
+    enum mesh_object_kind comm_kind = mesh_object_kind_of(recvComm);
+
+    if (comm_kind == MESH_OBJ_RECV_TCP) {
         return mesh_tcp_irecv(recvComm, n, data, sizes, tags, mhandles, request);
+    }
+    if (comm_kind != MESH_OBJ_RECV_RDMA) {
+        MESH_WARN("irecv: invalid recv comm object kind %d", comm_kind);
+        return ncclInvalidArgument;
     }
 
     struct mesh_recv_comm *comm = (struct mesh_recv_comm *)recvComm;
@@ -3665,9 +3711,9 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
 
     struct mesh_mr_handle *mrh = (struct mesh_mr_handle *)mhandles[0];
 
-    if (!mrh || !mrh->mr) {
-        MESH_WARN("irecv: invalid mhandle");
-        return ncclSystemError;
+    if (!mrh || !mesh_object_is(mrh, MESH_OBJ_MR_RDMA) || !mrh->mr) {
+        MESH_WARN("irecv: invalid RDMA mhandle");
+        return ncclInvalidArgument;
     }
 
     // Fast-fail if peer already known to be disconnected
@@ -3683,6 +3729,7 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
     if (!req) {
         return ncclSystemError;
     }
+    mesh_request_header_init(&req->header, MESH_OBJ_REQ_RDMA_RECV);
     __atomic_fetch_add(&g_mesh_state.requests_allocated, 1, __ATOMIC_RELAXED);
 
     req->used = 1;
@@ -3731,8 +3778,13 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
 
 static ncclResult_t mesh_iflush(void *recvComm, int n, void **data, int *sizes,
                                void **mhandles, void **request) {
-    // No flush needed for verbs - silence unused parameter warnings
-    (void)recvComm;
+    enum mesh_object_kind comm_kind = mesh_object_kind_of(recvComm);
+    if (comm_kind != MESH_OBJ_RECV_RDMA && comm_kind != MESH_OBJ_RECV_TCP) {
+        MESH_WARN("iflush: invalid recv comm object kind %d", comm_kind);
+        return ncclInvalidArgument;
+    }
+
+    // No flush needed for host-pointer verbs or TCP.
     (void)n;
     (void)data;
     (void)sizes;
@@ -3743,31 +3795,37 @@ static ncclResult_t mesh_iflush(void *recvComm, int n, void **data, int *sizes,
 
 /*
  * Check if a WC status indicates peer disconnection/failure
- * These errors typically mean the remote side is unreachable
+ * These errors typically mean the remote side is unreachable.
  */
 static int mesh_is_peer_failure(enum ibv_wc_status status) {
     switch (status) {
-        case IBV_WC_RETRY_EXC_ERR:      // Transport retry counter exceeded (remote unreachable)
-        case IBV_WC_RNR_RETRY_EXC_ERR:  // RNR retry counter exceeded (remote not ready)
-        case IBV_WC_REM_ABORT_ERR:      // Remote abort
-        case IBV_WC_REM_ACCESS_ERR:     // Remote access error
-        case IBV_WC_REM_INV_REQ_ERR:    // Remote invalid request
-        case IBV_WC_REM_OP_ERR:         // Remote operation error
-        case IBV_WC_WR_FLUSH_ERR:       // NCCL-001: QP in error state, all pending WRs flushed
+        case IBV_WC_RETRY_EXC_ERR:
+        case IBV_WC_RNR_RETRY_EXC_ERR:
+        case IBV_WC_REM_ABORT_ERR:
+        case IBV_WC_REM_ACCESS_ERR:
+        case IBV_WC_REM_INV_REQ_ERR:
+        case IBV_WC_REM_OP_ERR:
+        case IBV_WC_WR_FLUSH_ERR:
             return 1;
         default:
             return 0;
     }
 }
 
+static int mesh_is_rdma_request_kind(enum mesh_object_kind kind) {
+    return kind == MESH_OBJ_REQ_RDMA_SEND ||
+           kind == MESH_OBJ_REQ_RDMA_RECV;
+}
+
 /*
- * Mark peer as failed on a comm structure
- * This enables fast-fail for subsequent operations
+ * Mark peer as failed on a direct RDMA comm.
  */
-static void mesh_mark_peer_failed(struct mesh_request *req, enum ibv_wc_status status) {
+static void mesh_mark_peer_failed(struct mesh_request *req,
+                                  enum ibv_wc_status status) {
     if (!req || !req->comm) return;
 
-    if (req->is_send) {
+    enum mesh_object_kind kind = mesh_object_kind_of(req->comm);
+    if (kind == MESH_OBJ_SEND_RDMA) {
         struct mesh_send_comm *comm = (struct mesh_send_comm *)req->comm;
         if (!__atomic_load_n(&comm->peer_failed, __ATOMIC_ACQUIRE)) {
             __atomic_store_n(&comm->peer_failed, 1, __ATOMIC_RELEASE);
@@ -3776,7 +3834,7 @@ static void mesh_mark_peer_failed(struct mesh_request *req, enum ibv_wc_status s
                       status, ibv_wc_status_str(status));
         }
         __atomic_fetch_add(&comm->error_count, 1, __ATOMIC_RELAXED);
-    } else {
+    } else if (kind == MESH_OBJ_RECV_RDMA) {
         struct mesh_recv_comm *comm = (struct mesh_recv_comm *)req->comm;
         if (!__atomic_load_n(&comm->peer_failed, __ATOMIC_ACQUIRE)) {
             __atomic_store_n(&comm->peer_failed, 1, __ATOMIC_RELEASE);
@@ -3789,58 +3847,69 @@ static void mesh_mark_peer_failed(struct mesh_request *req, enum ibv_wc_status s
 }
 
 /*
- * Get the NIC associated with a request (via its comm).
- * Returns NULL if the request has no tracked comm.
+ * Get the NIC associated with a direct request through its typed comm.
  */
-static struct mesh_nic* mesh_request_nic(struct mesh_request *req) {
+static struct mesh_nic *mesh_request_nic(struct mesh_request *req) {
     if (!req || !req->comm) return NULL;
-    if (req->is_send) {
+
+    enum mesh_object_kind kind = mesh_object_kind_of(req->comm);
+    if (kind == MESH_OBJ_SEND_RDMA) {
         return ((struct mesh_send_comm *)req->comm)->nic;
-    } else {
+    }
+    if (kind == MESH_OBJ_RECV_RDMA) {
         return ((struct mesh_recv_comm *)req->comm)->nic;
     }
+    return NULL;
 }
 
 /*
- * Record completion metrics for a request: latency, success/error, in-flight decrement.
+ * Record completion metrics exactly once. This is called only by the request
+ * finalizer, including when one test() call consumes another request's CQE.
  */
 static void mesh_record_completion(struct mesh_request *req, int success) {
     struct mesh_nic *nic = mesh_request_nic(req);
     if (!nic) return;
 
-    /* Decrement in-flight counter */
     if (req->is_send) {
         uint64_t cur = __atomic_load_n(&nic->active_sends, __ATOMIC_RELAXED);
-        if (cur > 0) __atomic_fetch_sub(&nic->active_sends, 1, __ATOMIC_RELAXED);
+        if (cur > 0) {
+            __atomic_fetch_sub(&nic->active_sends, 1, __ATOMIC_RELAXED);
+        }
     } else {
         uint64_t cur = __atomic_load_n(&nic->active_recvs, __ATOMIC_RELAXED);
-        if (cur > 0) __atomic_fetch_sub(&nic->active_recvs, 1, __ATOMIC_RELAXED);
+        if (cur > 0) {
+            __atomic_fetch_sub(&nic->active_recvs, 1, __ATOMIC_RELAXED);
+        }
     }
 
     if (success) {
-        /* Record success and latency */
         if (req->is_send) {
             __atomic_fetch_add(&nic->send_completions, 1, __ATOMIC_RELAXED);
         } else {
             __atomic_fetch_add(&nic->recv_completions, 1, __ATOMIC_RELAXED);
         }
 
-        /* Compute completion latency */
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        uint64_t elapsed_us = (uint64_t)(now.tv_sec - req->start_time.tv_sec) * 1000000ULL
-                            + (uint64_t)(now.tv_nsec - req->start_time.tv_nsec) / 1000ULL;
-        __atomic_fetch_add(&nic->total_completion_us, elapsed_us, __ATOMIC_RELAXED);
+        uint64_t elapsed_us =
+            (uint64_t)(now.tv_sec - req->start_time.tv_sec) * 1000000ULL +
+            (uint64_t)(now.tv_nsec - req->start_time.tv_nsec) / 1000ULL;
+        __atomic_fetch_add(&nic->total_completion_us,
+                           elapsed_us, __ATOMIC_RELAXED);
 
-        /* Update max latency (relaxed CAS loop) */
-        uint64_t prev_max = __atomic_load_n(&nic->max_completion_us, __ATOMIC_RELAXED);
+        uint64_t prev_max =
+            __atomic_load_n(&nic->max_completion_us, __ATOMIC_RELAXED);
         while (elapsed_us > prev_max) {
-            if (__atomic_compare_exchange_n(&nic->max_completion_us, &prev_max,
-                                            elapsed_us, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            if (__atomic_compare_exchange_n(&nic->max_completion_us,
+                                            &prev_max,
+                                            elapsed_us,
+                                            1,
+                                            __ATOMIC_RELAXED,
+                                            __ATOMIC_RELAXED)) {
                 break;
+            }
         }
     } else {
-        /* Record error */
         if (req->is_send) {
             __atomic_fetch_add(&nic->send_errors, 1, __ATOMIC_RELAXED);
         } else {
@@ -3850,13 +3919,13 @@ static void mesh_record_completion(struct mesh_request *req, int success) {
 }
 
 /*
- * TICKET-9: Remove request from comm's tracking array before freeing
- * This prevents dangling pointers in the comm->requests[] array
+ * Remove a request from its typed direct comm tracking array.
  */
 static void mesh_untrack_request(struct mesh_request *req) {
     if (!req || !req->comm) return;
 
-    if (req->is_send) {
+    enum mesh_object_kind kind = mesh_object_kind_of(req->comm);
+    if (kind == MESH_OBJ_SEND_RDMA) {
         struct mesh_send_comm *comm = (struct mesh_send_comm *)req->comm;
         for (int i = 0; i < comm->num_requests; i++) {
             if (comm->requests[i] == req) {
@@ -3864,7 +3933,7 @@ static void mesh_untrack_request(struct mesh_request *req) {
                 return;
             }
         }
-    } else {
+    } else if (kind == MESH_OBJ_RECV_RDMA) {
         struct mesh_recv_comm *comm = (struct mesh_recv_comm *)req->comm;
         for (int i = 0; i < comm->num_requests; i++) {
             if (comm->requests[i] == req) {
@@ -3875,70 +3944,131 @@ static void mesh_untrack_request(struct mesh_request *req) {
     }
 }
 
+/*
+ * Transition a direct request exactly once from PENDING to a terminal state.
+ * Result, size, WC, and metrics become visible before the terminal release.
+ */
+static int mesh_complete_request(struct mesh_request *req,
+                                 ncclResult_t result,
+                                 const struct ibv_wc *wc,
+                                 size_t completed_size) {
+    int expected = MESH_REQ_PENDING;
+    if (!atomic_compare_exchange_strong_explicit(
+            &req->header.state,
+            &expected,
+            MESH_REQ_FINALIZING,
+            memory_order_acq_rel,
+            memory_order_acquire)) {
+        return 0;
+    }
+
+    req->header.result = result;
+    req->header.completed_size = completed_size;
+    if (wc) {
+        req->wc = *wc;
+    }
+
+    mesh_record_completion(req, result == ncclSuccess);
+    req->done = 1;
+
+    atomic_store_explicit(
+        &req->header.state,
+        result == ncclSuccess ? MESH_REQ_COMPLETE : MESH_REQ_ERROR,
+        memory_order_release);
+    return 1;
+}
+
+/*
+ * Return a terminal request to NCCL and release the plugin-side request object.
+ */
+static ncclResult_t mesh_consume_request(struct mesh_request *req,
+                                         int *done,
+                                         int *sizes) {
+    int state = atomic_load_explicit(&req->header.state, memory_order_acquire);
+    if (!mesh_request_state_is_terminal(state)) {
+        *done = 0;
+        return ncclSuccess;
+    }
+
+    ncclResult_t result = (ncclResult_t)req->header.result;
+    size_t completed_size = req->header.completed_size;
+
+    *done = 1;
+    if (sizes) {
+        *sizes = (int)completed_size;
+    }
+
+    mesh_untrack_request(req);
+    __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
+    uint64_t ops =
+        __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED) + 1;
+
+    if (ops % 10000 == 0) {
+        uint64_t alloc =
+            __atomic_load_n(&g_mesh_state.requests_allocated, __ATOMIC_RELAXED);
+        uint64_t freed =
+            __atomic_load_n(&g_mesh_state.requests_freed, __ATOMIC_RELAXED);
+        MESH_INFO("Stats: ops=%lu alloc=%lu freed=%lu outstanding=%lu "
+                  "pool_hits=%lu pool_misses=%lu",
+                  ops, alloc, freed, alloc - freed,
+                  g_mesh_state.conn_pool.hits,
+                  g_mesh_state.conn_pool.misses);
+    }
+
+    free(req);
+    return result;
+}
+
 static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
-    // Dispatch to TCP if in fallback mode (TICKET-4)
-    if (g_mesh_state.tcp_fallback_active) {
+    if (!done) {
+        return ncclInvalidArgument;
+    }
+
+    if (!request) {
+        *done = 1;
+        return ncclSuccess;
+    }
+
+    enum mesh_object_kind request_kind = mesh_object_kind_of(request);
+    if (request_kind == MESH_OBJ_REQ_TCP_SEND ||
+        request_kind == MESH_OBJ_REQ_TCP_RECV) {
         return mesh_tcp_test_impl(request, done, sizes);
+    }
+    if (!mesh_is_rdma_request_kind(request_kind)) {
+        MESH_WARN("test: invalid request object kind %d", request_kind);
+        *done = 1;
+        return ncclInvalidArgument;
     }
 
     struct mesh_request *req = (struct mesh_request *)request;
-    struct ibv_wc wc;
-    int ret;
-
-    if (!req) {
-        *done = 1;
-        return ncclSuccess;
+    int state = atomic_load_explicit(&req->header.state, memory_order_acquire);
+    if (mesh_request_state_is_terminal(state)) {
+        return mesh_consume_request(req, done, sizes);
     }
 
-    // NCCL-001: Check for fatal async event
     if (mesh_check_fatal_error()) {
-        MESH_WARN("mesh_test: plugin in fatal error state — %s", g_mesh_state.fatal_error_msg);
-        *done = 1;
-        mesh_untrack_request(req);
-        __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
-        free(req);
-        return ncclInternalError;
-    }
-
-    if (__atomic_load_n(&req->done, __ATOMIC_ACQUIRE)) {
-        *done = 1;
-        if (sizes) *sizes = req->size;
-        mesh_record_completion(req, 1);  // Per-NIC metrics: success
-        mesh_untrack_request(req);  // TICKET-9: Remove from comm tracking
-        __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
-        __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
-        free(req);  // TICKET-8: Free completed request to prevent memory leak
-        return ncclSuccess;
+        MESH_WARN("mesh_test: plugin in fatal error state — %s",
+                  g_mesh_state.fatal_error_msg);
+        mesh_complete_request(req, ncclInternalError, NULL, 0);
+        return mesh_consume_request(req, done, sizes);
     }
 
     if (!req->cq) {
         MESH_WARN("mesh_test: request has no CQ");
-        __atomic_store_n(&req->done, 1, __ATOMIC_RELEASE);
-        *done = 1;
-        mesh_untrack_request(req);  // TICKET-9: Remove from comm tracking
-        __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
-        free(req);  // TICKET-8: Free request on completion
-        return ncclSuccess;
+        mesh_complete_request(req, ncclInternalError, NULL, 0);
+        return mesh_consume_request(req, done, sizes);
     }
 
-    // Poll for completions - we might get completions for OTHER requests
-    // that share this CQ, so keep polling until we find ours or CQ is empty
     while (1) {
-        ret = ibv_poll_cq(req->cq, 1, &wc);
+        struct ibv_wc wc;
+        int ret = ibv_poll_cq(req->cq, 1, &wc);
         if (ret < 0) {
             MESH_WARN("mesh_test: ibv_poll_cq failed: %s", strerror(errno));
-            return ncclSystemError;
+            mesh_complete_request(req, ncclSystemError, NULL, 0);
+            return mesh_consume_request(req, done, sizes);
         }
 
         if (ret == 0) {
-            /*
-             * NCCL-001 Work Item 2: Completion timeout detection
-             *
-             * No completions returned. Check if this request has been pending
-             * longer than NCCL_MESH_TIMEOUT_SEC. A healthy RDMA operation
-             * completes in microseconds — if 30 seconds have passed, the link
-             * or QP is dead and no amount of waiting will fix it.
-             */
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
             long elapsed_sec = now.tv_sec - req->start_time.tv_sec;
@@ -3949,146 +4079,117 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
                 uint32_t qp_num = 0;
                 uint64_t conn_age = 0;
 
-                if (req->is_send && req->comm) {
-                    struct mesh_send_comm *sc = (struct mesh_send_comm *)req->comm;
+                enum mesh_object_kind comm_kind =
+                    mesh_object_kind_of(req->comm);
+                if (comm_kind == MESH_OBJ_SEND_RDMA) {
+                    struct mesh_send_comm *sc =
+                        (struct mesh_send_comm *)req->comm;
                     peer_ip = sc->peer_ip;
                     qp_num = sc->qp ? sc->qp->qp_num : 0;
                     conn_age = mesh_conn_age_sec(&sc->conn_established_time);
-                    // Mark peer as failed so subsequent ops fail fast
                     __atomic_store_n(&sc->peer_failed, 1, __ATOMIC_RELEASE);
-                } else if (!req->is_send && req->comm) {
-                    struct mesh_recv_comm *rc = (struct mesh_recv_comm *)req->comm;
+                } else if (comm_kind == MESH_OBJ_RECV_RDMA) {
+                    struct mesh_recv_comm *rc =
+                        (struct mesh_recv_comm *)req->comm;
                     peer_ip = rc->peer_ip;
                     qp_num = rc->qp ? rc->qp->qp_num : 0;
                     conn_age = mesh_conn_age_sec(&rc->conn_established_time);
                     __atomic_store_n(&rc->peer_failed, 1, __ATOMIC_RELEASE);
                 }
 
-                MESH_ERROR_STRUCTURED(peer_ip, qp_num, op_str,
-                    "COMPLETION_TIMEOUT", conn_age,
+                MESH_ERROR_STRUCTURED(
+                    peer_ip, qp_num, op_str, "COMPLETION_TIMEOUT", conn_age,
                     "Completion timeout after %lds — marking connection dead "
                     "(expected_bytes=%zu, timeout=%ds)",
                     elapsed_sec, req->size, g_mesh_state.op_timeout_sec);
 
-                // Per-NIC metrics: record timeout
-                {
-                    struct mesh_nic *nic = mesh_request_nic(req);
-                    if (nic) __atomic_fetch_add(&nic->completion_timeouts, 1, __ATOMIC_RELAXED);
+                struct mesh_nic *nic = mesh_request_nic(req);
+                if (nic) {
+                    __atomic_fetch_add(&nic->completion_timeouts,
+                                       1, __ATOMIC_RELAXED);
                 }
 
                 if (g_mesh_state.fatal_on_timeout) {
-                    mesh_record_completion(req, 0);  // Per-NIC metrics: error
-                    *done = 1;
-                    mesh_untrack_request(req);
-                    __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
-                    free(req);
-                    return ncclInternalError;
+                    mesh_complete_request(req, ncclInternalError, NULL, 0);
+                    return mesh_consume_request(req, done, sizes);
                 }
             }
 
-            // No completions yet and no timeout - not done
             *done = 0;
             return ncclSuccess;
         }
 
-        // Got a completion - get the associated request
-        struct mesh_request *completed_req = (struct mesh_request *)(uintptr_t)wc.wr_id;
+        struct mesh_request *completed_req =
+            (struct mesh_request *)(uintptr_t)wc.wr_id;
+        enum mesh_object_kind completed_kind =
+            mesh_object_kind_of(completed_req);
 
-        /*
-         * NCCL-001 Work Item 1: WC status checking with structured logging
-         *
-         * Inspect every Work Completion. Any status other than SUCCESS means
-         * the operation failed. Specific statuses indicate link-level failure:
-         * RETRY_EXC_ERR, RNR_RETRY_EXC_ERR, REM_ACCESS_ERR, REM_OP_ERR,
-         * WR_FLUSH_ERR (QP in error state).
-         */
+        if (!mesh_is_rdma_request_kind(completed_kind)) {
+            MESH_WARN("mesh_test: CQE contains invalid request object kind %d",
+                      completed_kind);
+            mesh_complete_request(req, ncclInternalError, NULL, 0);
+            return mesh_consume_request(req, done, sizes);
+        }
+
         if (wc.status != IBV_WC_SUCCESS) {
-            const char *op_str = (completed_req && completed_req->is_send) ? "SEND" : "RECV";
+            const char *op_str =
+                completed_req->is_send ? "SEND" : "RECV";
             uint32_t peer_ip = 0;
             uint32_t qp_num = wc.qp_num;
             uint64_t conn_age = 0;
 
-            // Extract peer info for structured logging
-            if (completed_req && completed_req->comm) {
-                if (completed_req->is_send) {
-                    struct mesh_send_comm *sc = (struct mesh_send_comm *)completed_req->comm;
-                    peer_ip = sc->peer_ip;
-                    conn_age = mesh_conn_age_sec(&sc->conn_established_time);
-                } else {
-                    struct mesh_recv_comm *rc = (struct mesh_recv_comm *)completed_req->comm;
-                    peer_ip = rc->peer_ip;
-                    conn_age = mesh_conn_age_sec(&rc->conn_established_time);
-                }
+            enum mesh_object_kind comm_kind =
+                mesh_object_kind_of(completed_req->comm);
+            if (comm_kind == MESH_OBJ_SEND_RDMA) {
+                struct mesh_send_comm *sc =
+                    (struct mesh_send_comm *)completed_req->comm;
+                peer_ip = sc->peer_ip;
+                conn_age = mesh_conn_age_sec(&sc->conn_established_time);
+            } else if (comm_kind == MESH_OBJ_RECV_RDMA) {
+                struct mesh_recv_comm *rc =
+                    (struct mesh_recv_comm *)completed_req->comm;
+                peer_ip = rc->peer_ip;
+                conn_age = mesh_conn_age_sec(&rc->conn_established_time);
             }
 
-            MESH_ERROR_STRUCTURED(peer_ip, qp_num, op_str,
-                ibv_wc_status_str(wc.status), conn_age,
+            MESH_ERROR_STRUCTURED(
+                peer_ip, qp_num, op_str, ibv_wc_status_str(wc.status),
+                conn_age,
                 "vendor_err=0x%x opcode=%d — marking connection dead",
                 wc.vendor_err, wc.opcode);
 
-            // Check if this indicates peer failure (includes WR_FLUSH_ERR)
-            if (mesh_is_peer_failure(wc.status) || wc.status == IBV_WC_WR_FLUSH_ERR) {
+            if (mesh_is_peer_failure(wc.status)) {
                 mesh_mark_peer_failed(completed_req, wc.status);
             }
 
-            // Mark the request as done (with error)
-            if (completed_req) {
-                completed_req->wc = wc;
-                __atomic_store_n(&completed_req->done, 1, __ATOMIC_RELEASE);
-                mesh_record_completion(completed_req, 0);  // Per-NIC metrics: error
-            }
-
-            // If this is our request, return error immediately
-            if (completed_req == req) {
-                *done = 1;
-                mesh_untrack_request(req);  // TICKET-9: Remove from comm tracking
-                __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
-                __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
-                free(req);  // TICKET-8: Free request on error completion
-                return ncclInternalError;
-            }
-
-            // Continue polling for other completions
-            continue;
+            mesh_complete_request(
+                completed_req, ncclInternalError, &wc, 0);
+        } else {
+            mesh_complete_request(
+                completed_req, ncclSuccess, &wc, completed_req->size);
         }
 
-        // Success - mark the request as done
-        if (completed_req) {
-            completed_req->wc = wc;
-            __atomic_store_n(&completed_req->done, 1, __ATOMIC_RELEASE);
-        }
-
-        // Is it OUR request?
         if (completed_req == req) {
-            mesh_record_completion(req, 1);  // Per-NIC metrics: success + latency
-            *done = 1;
-            if (sizes) *sizes = req->size;
-            mesh_untrack_request(req);  // TICKET-9: Remove from comm tracking
-            __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
-            uint64_t ops = __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED) + 1;
-            // TICKET-8: Periodic stats logging every 10000 ops
-            if (ops % 10000 == 0) {
-                uint64_t alloc = __atomic_load_n(&g_mesh_state.requests_allocated, __ATOMIC_RELAXED);
-                uint64_t freed = __atomic_load_n(&g_mesh_state.requests_freed, __ATOMIC_RELAXED);
-                MESH_INFO("Stats: ops=%lu alloc=%lu freed=%lu outstanding=%lu pool_hits=%lu pool_misses=%lu",
-                          ops, alloc, freed, alloc - freed,
-                          g_mesh_state.conn_pool.hits, g_mesh_state.conn_pool.misses);
-            }
-            free(req);  // TICKET-8: Free request on success completion
-            return ncclSuccess;
-        } else if (completed_req) {
-            // Not our request but completed successfully - record its metrics too
-            mesh_record_completion(completed_req, 1);
+            return mesh_consume_request(req, done, sizes);
         }
 
-        // Not our request - keep polling
+        /*
+         * Foreign completions remain in their own request objects with a
+         * persistent result. Their later test() call consumes that result
+         * without recording metrics a second time.
+         */
     }
 }
 
 static ncclResult_t mesh_closeSend(void *sendComm) {
-    // Dispatch to TCP if in fallback mode (TICKET-4)
-    if (g_mesh_state.tcp_fallback_active) {
+    enum mesh_object_kind comm_kind = mesh_object_kind_of(sendComm);
+
+    if (comm_kind == MESH_OBJ_SEND_TCP) {
         return mesh_tcp_closeSend(sendComm);
+    }
+    if (comm_kind != MESH_OBJ_SEND_RDMA) {
+        MESH_WARN("closeSend: invalid send comm object kind %d", comm_kind);
+        return sendComm ? ncclInvalidArgument : ncclSuccess;
     }
 
     struct mesh_send_comm *comm = (struct mesh_send_comm *)sendComm;
@@ -4100,7 +4201,9 @@ static ncclResult_t mesh_closeSend(void *sendComm) {
         int outstanding = 0;
         for (int i = 0; i < comm->num_requests; i++) {
             struct mesh_request *req = comm->requests[i];
-            if (req && !__atomic_load_n(&req->done, __ATOMIC_ACQUIRE)) {
+            if (req && !mesh_request_state_is_terminal(
+                           atomic_load_explicit(&req->header.state,
+                                                memory_order_acquire))) {
                 outstanding++;
                 MESH_DEBUG("closeSend: freeing outstanding request %d", i);
                 __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
@@ -4155,9 +4258,14 @@ static ncclResult_t mesh_closeSend(void *sendComm) {
 }
 
 static ncclResult_t mesh_closeRecv(void *recvComm) {
-    // Dispatch to TCP if in fallback mode (TICKET-4)
-    if (g_mesh_state.tcp_fallback_active) {
+    enum mesh_object_kind comm_kind = mesh_object_kind_of(recvComm);
+
+    if (comm_kind == MESH_OBJ_RECV_TCP) {
         return mesh_tcp_closeRecv(recvComm);
+    }
+    if (comm_kind != MESH_OBJ_RECV_RDMA) {
+        MESH_WARN("closeRecv: invalid recv comm object kind %d", comm_kind);
+        return recvComm ? ncclInvalidArgument : ncclSuccess;
     }
 
     struct mesh_recv_comm *comm = (struct mesh_recv_comm *)recvComm;
@@ -4169,7 +4277,9 @@ static ncclResult_t mesh_closeRecv(void *recvComm) {
         int outstanding = 0;
         for (int i = 0; i < comm->num_requests; i++) {
             struct mesh_request *req = comm->requests[i];
-            if (req && !__atomic_load_n(&req->done, __ATOMIC_ACQUIRE)) {
+            if (req && !mesh_request_state_is_terminal(
+                           atomic_load_explicit(&req->header.state,
+                                                memory_order_acquire))) {
                 outstanding++;
                 MESH_DEBUG("closeRecv: freeing outstanding request %d", i);
                 __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
@@ -4215,9 +4325,14 @@ static ncclResult_t mesh_closeRecv(void *recvComm) {
 }
 
 static ncclResult_t mesh_closeListen(void *listenComm) {
-    // Dispatch to TCP if in fallback mode (TICKET-4)
-    if (g_mesh_state.tcp_fallback_active) {
+    enum mesh_object_kind comm_kind = mesh_object_kind_of(listenComm);
+
+    if (comm_kind == MESH_OBJ_LISTEN_TCP) {
         return mesh_tcp_closeListen(listenComm);
+    }
+    if (comm_kind != MESH_OBJ_LISTEN_RDMA) {
+        MESH_WARN("closeListen: invalid listen object kind %d", comm_kind);
+        return listenComm ? ncclInvalidArgument : ncclSuccess;
     }
 
     struct mesh_listen_comm *comm = (struct mesh_listen_comm *)listenComm;
@@ -4291,7 +4406,18 @@ static ncclResult_t mesh_closeListen(void *listenComm) {
  */
 static ncclResult_t mesh_getDeviceMr(void *comm, void *mhandle, void **dptr_mhandle) {
     (void)comm;
-    (void)mhandle;
+
+    if (!dptr_mhandle) {
+        return ncclInvalidArgument;
+    }
+    if (mhandle) {
+        enum mesh_object_kind mr_kind = mesh_object_kind_of(mhandle);
+        if (mr_kind != MESH_OBJ_MR_RDMA && mr_kind != MESH_OBJ_MR_TCP) {
+            MESH_WARN("getDeviceMr: invalid memory handle kind %d", mr_kind);
+            return ncclInvalidArgument;
+        }
+    }
+
     *dptr_mhandle = NULL;
     return ncclSuccess;
 }
@@ -4305,9 +4431,15 @@ static ncclResult_t mesh_getDeviceMr(void *comm, void *mhandle, void **dptr_mhan
  * control), this is a no-op.
  */
 static ncclResult_t mesh_irecvConsumed(void *recvComm, int n, void *request) {
-    (void)recvComm;
+    enum mesh_object_kind comm_kind = mesh_object_kind_of(recvComm);
     (void)n;
     (void)request;
+
+    if (comm_kind != MESH_OBJ_RECV_RDMA && comm_kind != MESH_OBJ_RECV_TCP) {
+        MESH_WARN("irecvConsumed: invalid recv comm object kind %d", comm_kind);
+        return ncclInvalidArgument;
+    }
+
     return ncclSuccess;
 }
 
