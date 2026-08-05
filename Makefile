@@ -1,12 +1,20 @@
 # NCCL Mesh Plugin Makefile
 
 CC = gcc
+PKG_CONFIG ?= pkg-config
+
+# Keep project quote-includes separate so angle-bracket system headers,
+# including <infiniband/verbs.h>, resolve from the system include paths.
+IBVERBS_CFLAGS := $(shell $(PKG_CONFIG) --cflags libibverbs 2>/dev/null)
+IBVERBS_LIBS := $(shell $(PKG_CONFIG) --libs libibverbs 2>/dev/null)
+ifeq ($(strip $(IBVERBS_LIBS)),)
+IBVERBS_LIBS := -libverbs
+endif
+
 CFLAGS = -Wall -Wextra -O2 -fPIC -g
-CFLAGS += -I. -I./include
-# LDFLAGS for systems with libibverbs
-# LDFLAGS = -shared -libverbs -lpthread
-# LDFLAGS for stub/TCP-only build
-LDFLAGS = -shared -lpthread -ldl
+CFLAGS += -I. -iquote ./include $(IBVERBS_CFLAGS)
+LDFLAGS = -shared
+LDLIBS = $(IBVERBS_LIBS) -lpthread -ldl
 
 # Target
 TARGET = libnccl-net.so
@@ -20,7 +28,7 @@ OBJS = $(SRCS:.c=.o)
 all: $(TARGET) $(TARGET_MESH)
 
 $(TARGET): $(OBJS)
-	$(CC) $(OBJS) -o $@ $(LDFLAGS)
+	$(CC) $(OBJS) -o $@ $(LDFLAGS) $(LDLIBS)
 
 $(TARGET_MESH): $(TARGET)
 	ln -sf $(TARGET) $(TARGET_MESH)
@@ -54,6 +62,7 @@ info:
 	@echo "CC      = $(CC)"
 	@echo "CFLAGS  = $(CFLAGS)"
 	@echo "LDFLAGS = $(LDFLAGS)"
+	@echo "LDLIBS  = $(LDLIBS)"
 	@echo "TARGET  = $(TARGET)"
 
 # ============================================================================
@@ -61,7 +70,7 @@ info:
 # ============================================================================
 
 # Test flags (no -fPIC, add pthread)
-TEST_CFLAGS = -Wall -Wextra -O2 -g -I. -I./include
+TEST_CFLAGS = -Wall -Wextra -O2 -g -I. -iquote ./include $(IBVERBS_CFLAGS)
 TEST_LDFLAGS = -lpthread
 
 # Unit test for routing

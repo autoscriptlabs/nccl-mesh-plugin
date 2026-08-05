@@ -46,11 +46,20 @@ enum {
     CUDA_MEMORY_TYPE_MANAGED = 3,
 };
 
+/*
+ * cudaPointerAttributes grew in CUDA 13 by adding reserved[8].
+ *
+ * This plugin resolves cudaPointerGetAttributes with dlsym instead of including
+ * the CUDA headers, so this compatibility struct must be at least as large as
+ * the runtime struct.  It is safe to pass the larger zero-initialized struct to
+ * CUDA 11/12 runtimes, while CUDA 13 would overflow the old 24-byte definition.
+ */
 struct cuda_pointer_attributes {
     int type;           /* cudaMemoryType */
     int device;
     void *devicePointer;
     void *hostPointer;
+    long reserved[8];
 };
 
 typedef int (*cudaPointerGetAttributes_fn)(struct cuda_pointer_attributes *, const void *);
@@ -399,6 +408,14 @@ int mesh_setup_nic(struct mesh_nic *nic, struct ibv_device *device) {
         snprintf(sysfs_path, sizeof(sysfs_path),
                  "/sys/class/infiniband/%s/device", nic->dev_name);
         char *real = realpath(sysfs_path, resolved);
+        if (!real) {
+            /* dev_name may be the netdev (e.g. enp1s0f1np1) rather than the
+             * RoCE device (e.g. rocep1s0f1); the PCI path is resolvable either
+             * way, so retry under /sys/class/net before giving up. */
+            snprintf(sysfs_path, sizeof(sysfs_path),
+                     "/sys/class/net/%s/device", nic->dev_name);
+            real = realpath(sysfs_path, resolved);
+        }
         if (real) {
             strncpy(nic->pci_path, real, sizeof(nic->pci_path) - 1);
             MESH_DEBUG("NIC %s: PCI path %s", nic->dev_name, nic->pci_path);
@@ -3002,6 +3019,7 @@ static ncclResult_t mesh_getProperties(int dev, ncclNetProperties_v8_t *props) {
     props->pciPath = nic->pci_path[0] ? nic->pci_path : NULL;
     props->guid = 0;
     props->ptrSupport = NCCL_PTR_HOST;
+    props->regIsGlobal = 0;
     // Use actual link speed if available, otherwise default to 100 Gbps
     props->speed = (nic->link_speed_mbps > 0) ? nic->link_speed_mbps : 100000;
     props->port = nic->port_num;
@@ -3011,7 +3029,6 @@ static ncclResult_t mesh_getProperties(int dev, ncclNetProperties_v8_t *props) {
     props->maxRecvs = 1;
     props->netDeviceType = NCCL_NET_DEVICE_HOST;
     props->netDeviceVersion = NCCL_NET_DEVICE_INVALID_VERSION;
-    props->maxP2pBytes = NCCL_MAX_NET_SIZE_BYTES;
     
     return ncclSuccess;
 }
@@ -4328,7 +4345,6 @@ static ncclResult_t mesh_getProperties_v9(int dev, ncclNetProperties_v9_t *props
     props->netDeviceType = NCCL_NET_DEVICE_HOST;
     props->netDeviceVersion = NCCL_NET_DEVICE_INVALID_VERSION;
     props->vProps.ndevs = 0;
-    props->vProps.devs = NULL;
     props->maxP2pBytes = NCCL_MAX_NET_SIZE_BYTES;
     props->maxCollBytes = NCCL_MAX_NET_SIZE_BYTES;
 
