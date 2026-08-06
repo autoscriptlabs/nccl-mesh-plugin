@@ -8,21 +8,26 @@
 *~
 .vscode/
 .idea/
+
 # Test binaries
 tests/test_routing
 tests/test_error_paths
+tests/test_object_dispatch
+
 # Debug files
 core
 *.core
+core.*
+*.log
+
 # Python artifacts
 __pycache__/
 *.py[cod]
+
 # Benchmark output
 benchmark_results_*.jsonl
 tests/benchmark_results_*.jsonl
-# Local crash/debug output
-core.*
-*.log
+
 # Local patch backups
 *.before-loop-fix
 *.orig

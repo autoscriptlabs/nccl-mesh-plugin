@@ -1,0 +1,37 @@
+# Merge these keys under an existing sparkrun recipe's `env:` mapping.
+# Replace paths and interface names for the local image/cluster.
+
+# Pin the NCCL library actually validated with the image.
+LD_PRELOAD: /opt/nccl-2.30.4/libnccl.so.2
+LD_LIBRARY_PATH: /opt/nccl-2.30.4
+
+# External NCCL network plugin, as seen inside the container.
+NCCL_NET: "Mesh"
+NCCL_NET_PLUGIN: /cache/huggingface/nccl-mesh/libnccl-net.so
+
+# Shared management interface for NCCL bootstrap and hybrid TCP.
+NCCL_SOCKET_IFNAME: "=enP7s7"
+NCCL_SOCKET_FAMILY: "AF_INET"
+
+# Direct-neighbor RDMA plus non-neighbor management TCP.
+NCCL_MESH_HYBRID_TCP: "1"
+NCCL_MESH_GID_INDEX: "3"
+NCCL_MESH_DEBUG: "1"
+
+# Production-tested profile for uneven multi-rank model startup.
+NCCL_MESH_FAST_FAIL: "0"
+NCCL_MESH_TIMEOUT_SEC: "900"
+NCCL_MESH_FATAL_ON_TIMEOUT: "1"
+
+# Periodic latency fields are currently unreliable.
+NCCL_MESH_METRICS: "0"
+
+# Keep the bulk graph aligned with the physical ring.
+NCCL_ALGO: "Ring"
+NCCL_COLLNET_ENABLE: "0"
+NCCL_NVLS_ENABLE: "0"
+
+# Focused startup/transport diagnostics.
+NCCL_DEBUG: "INFO"
+NCCL_DEBUG_SUBSYS: "INIT,NET"
+NCCL_DEBUG_FILE: /cache/huggingface/nccl_%h_%p.log

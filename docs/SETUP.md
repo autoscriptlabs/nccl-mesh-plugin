@@ -1,344 +1,277 @@
-# Hardware Setup Guide
+# Hardware and Network Setup
 
-This guide covers setting up a direct-connect RDMA mesh topology with multiple nodes.
+## Reference topology
 
-## Overview
+The validated deployment uses four DGX Spark systems in a physical ring:
 
-Our reference setup uses NVIDIA DGX Spark workstations (Grace Hopper architecture with unified memory) connected via direct RDMA cables. The supported topology options are:
-
-- **3 nodes**: Triangle mesh (fully connected) - each node directly connected to all others
-- **4+ nodes ring**: Ring topology - each node connects to 2 neighbors, relay routing for non-adjacent
-- **Any nodes line**: Line topology - chain of nodes, relay routing for multi-hop
-
-Each ConnectX-7 port supports up to **200 Gbps** via dual PCIe 5.0 x4 channels, though current software uses single-channel mode (100 Gbps per link).
-
-**New in v2.0**: The plugin now supports partial mesh topologies with automatic relay routing. Non-adjacent nodes communicate through intermediate relay nodes.
-
-## Hardware Requirements
-
-- 3-4 nodes with RDMA-capable NICs (ConnectX-7 recommended for dual-channel support)
-- Direct-attach cables (QSFP56/QSFP112 for 100/200GbE)
-- For triangle mesh: Each node needs 2 NICs
-- For ring topology: Each node needs 2 NICs
-
-## Network Topology
-
-### Triangle Mesh (3 Nodes)
-
-```
-        Node A
-       /      \
-   NIC1        NIC2
-     |          |
-192.168.101.x  192.168.100.x
-     |          |
-   NIC1        NIC1
-     |          |
-   Node B ---- Node C
-          NIC2
-     192.168.102.x
+```text
+spark-a ───── spark-b
+   │             │
+   │             │
+spark-d ───── spark-c
 ```
 
-### IP Address Assignment
+Each host has:
 
-| Link | Subnet | Node A | Node B | Node C |
-|------|--------|--------|--------|--------|
-| A↔B | 192.168.101.0/24 | .2 | .3 | - |
-| A↔C | 192.168.100.0/24 | .2 | - | .3 |
-| B↔C | 192.168.102.0/24 | - | .2 | .3 |
+- one direct RoCE link to its clockwise neighbor;
+- one direct RoCE link to its counter-clockwise neighbor;
+- one shared management interface reachable by every host.
 
-## Network Configuration
+The management network is used for orchestration, NCCL bootstrap, and optional
+hybrid TCP. Direct neighbors use RoCE for NCCL payloads.
 
-### 1. Identify NICs
+## Address plan
+
+Use one non-overlapping subnet per cable. `/30` is sufficient for a two-endpoint
+IPv4 link:
+
+| Link | Example subnet |
+|---|---|
+| spark-a ↔ spark-b | `192.168.100.0/30` |
+| spark-b ↔ spark-c | `192.168.101.0/30` |
+| spark-c ↔ spark-d | `192.168.102.0/30` |
+| spark-d ↔ spark-a | `192.168.103.0/30` |
+
+The exact addresses and interface names are site-specific. Do not reuse the same
+subnet on unrelated cables.
+
+## Identify the devices
 
 ```bash
-# List RDMA devices
 ibv_devices
-
-# List network interfaces with RDMA
-ls -la /sys/class/infiniband/*/device/net/
-```
-
-### 2. Configure IP Addresses
-
-On **Node A** (example):
-
-```bash
-# Link to Node B
-sudo ip addr add 192.168.101.2/24 dev enp1s0f0np0
-sudo ip link set enp1s0f0np0 up
-
-# Link to Node C  
-sudo ip addr add 192.168.100.2/24 dev enp1s0f1np1
-sudo ip link set enp1s0f1np1 up
-```
-
-On **Node B**:
-
-```bash
-# Link to Node A
-sudo ip addr add 192.168.101.3/24 dev enp1s0f0np0
-sudo ip link set enp1s0f0np0 up
-
-# Link to Node C
-sudo ip addr add 192.168.102.2/24 dev enp1s0f1np1
-sudo ip link set enp1s0f1np1 up
-```
-
-On **Node C**:
-
-```bash
-# Link to Node A
-sudo ip addr add 192.168.100.3/24 dev enp1s0f0np0
-sudo ip link set enp1s0f0np0 up
-
-# Link to Node B
-sudo ip addr add 192.168.102.3/24 dev enp1s0f1np1
-sudo ip link set enp1s0f1np1 up
-```
-
-### 3. Make Configuration Persistent
-
-Create netplan config (Ubuntu):
-
-```yaml
-# /etc/netplan/99-rdma-mesh.yaml
-network:
-  version: 2
-  ethernets:
-    enp1s0f0np0:
-      addresses:
-        - 192.168.101.2/24  # Adjust per node
-    enp1s0f1np1:
-      addresses:
-        - 192.168.100.2/24  # Adjust per node
-```
-
-Apply:
-```bash
-sudo netplan apply
-```
-
-## Verify Connectivity
-
-### 1. Ping Test
-
-From Node A:
-```bash
-ping 192.168.101.3  # Node B
-ping 192.168.100.3  # Node C
-```
-
-### 2. RDMA Test
-
-```bash
-# On Node B (server)
-ib_send_bw -d rocep1s0f0 -x 3
-
-# On Node A (client)
-ib_send_bw -d rocep1s0f0 -x 3 192.168.101.3
-```
-
-Expected output: ~12 GB/s for 100GbE
-
-### 3. Verify GID Index
-
-```bash
-# Show GID table
-show_gids
-
-# Find RoCE v2 GID (usually index 3)
-ibv_devinfo -v | grep -A5 GID
-```
-
-## RoCE Configuration
-
-### Enable RoCE v2
-
-```bash
-# Check current mode
-cat /sys/class/infiniband/rocep*/ports/1/gid_attrs/types/*
-
-# Enable RoCE v2 (if needed)
-echo "RoCE v2" | sudo tee /sys/class/infiniband/rocep1s0f0/ports/1/gid_attrs/types/0
-```
-
-### Configure ECN (Optional but Recommended)
-
-```bash
-# Enable ECN for RoCE
-sudo sysctl -w net.ipv4.tcp_ecn=1
-
-# Configure PFC (Priority Flow Control) on switch if applicable
-```
-
-## Firewall Configuration
-
-Open ports for NCCL communication:
-
-```bash
-# TCP ports for handshake (dynamic, 40000-50000 range)
-sudo ufw allow 40000:50000/tcp
-
-# Or disable firewall for mesh interfaces
-sudo ufw allow in on enp1s0f0np0
-sudo ufw allow in on enp1s0f1np1
-```
-
-## Troubleshooting
-
-### No RDMA Devices Found
-
-```bash
-# Load kernel modules
-sudo modprobe ib_core
-sudo modprobe mlx5_core
-sudo modprobe mlx5_ib
-
-# Check dmesg
-dmesg | grep -i mlx
-```
-
-### Link Not Coming Up
-
-```bash
-# Check physical connection
-ethtool enp1s0f0np0
-
-# Check for errors
-ip -s link show enp1s0f0np0
-```
-
-### RDMA Connection Fails
-
-```bash
-# Verify GID is populated
-cat /sys/class/infiniband/rocep1s0f0/ports/1/gids/3
-
-# Check RDMA CM
 rdma link show
+for d in /sys/class/infiniband/*/device/net/*; do
+  readlink -f "$d"
+done
+ip -br link
+ip -br -4 address
 ```
 
-### Wrong GID Index
+Record the mapping between:
 
-Try different GID indices:
+- Linux interface;
+- verbs device;
+- physical cable peer;
+- IPv4 address/prefix;
+- usable RoCEv2 GID index.
+
+## Configure each direct link
+
+Example only:
 
 ```bash
-export NCCL_MESH_GID_INDEX=0  # or 1, 2, 3...
+sudo ip addr add 192.168.100.1/30 dev <spark-a-to-b>
+sudo ip link set <spark-a-to-b> up
 ```
 
-## Scaling to 4+ Nodes: Ring Topology
+Configure the peer with the other usable address from the same `/30`.
 
-Full mesh becomes impractical beyond 3 nodes (N nodes requires N-1 NICs each, N*(N-1)/2 total links). For 4+ nodes, we use a **ring topology** with automatic relay routing:
+Make the configuration persistent with the host's network manager only after
+the temporary configuration has been verified.
 
-### Ring Topology (4 Nodes)
+## Verify link-local IP connectivity
 
-```
-        Node A
-       /      \
-   NIC1        NIC2
-     |          |
-192.168.101.x  192.168.100.x
-     |          |
-   NIC1        NIC1
-     |          |
-   Node B      Node D
-     |          |
-   NIC2        NIC2
-     |          |
-192.168.102.x  192.168.103.x
-     |          |
-   NIC1        NIC2
-     \          /
-      \        /
-       Node C
-```
-
-### Ring IP Address Assignment
-
-| Link | Subnet | Node A | Node B | Node C | Node D |
-|------|--------|--------|--------|--------|--------|
-| A↔B | 192.168.101.0/24 | .2 | .3 | - | - |
-| B↔C | 192.168.102.0/24 | - | .2 | .3 | - |
-| C↔D | 192.168.103.0/24 | - | - | .2 | .3 |
-| D↔A | 192.168.100.0/24 | .3 | - | - | .2 |
-
-### Ring Advantages
-
-- **Only 2 NICs per node** (vs 3 for full mesh with 4 nodes)
-- **Only 4 links total** (vs 6 for full mesh)
-- **Simpler cabling**: Each node connects to exactly 2 neighbors
-- **Dual-path routing**: Opposite nodes can use either CW or CCW path
-- **Load balancing**: Traffic automatically balanced across paths
-
-### Ring Communication Patterns
-
-| Source | Destination | Hops | Path Options |
-|--------|-------------|------|--------------|
-| A | B | 1 | Direct |
-| A | C | 2 | A→B→C (CW) or A→D→C (CCW) |
-| A | D | 1 | Direct |
-| B | D | 2 | B→A→D (CCW) or B→C→D (CW) |
-
-The plugin automatically:
-1. Detects the ring topology
-2. Computes both CW and CCW paths
-3. Balances load across equal-length paths
-4. Forwards traffic through relay nodes
-
-### Ring Configuration
+From each host, ping only its two physical neighbors on the corresponding direct
+addresses:
 
 ```bash
-# Enable load balancing (default: on)
-export NCCL_MESH_RING_LOAD_BALANCE=1
-
-# Prefer shorter path always (disable load balancing)
-export NCCL_MESH_RING_PREFER_SHORT=1
-
-# Threshold before switching paths (default: 1MB)
-export NCCL_MESH_RING_BALANCE_THRESHOLD=1048576
+ping -c 3 <neighbor-direct-ip>
 ```
 
-> **Note**: Full mesh with 4 nodes would require 3 NICs per node, which isn't possible on DGX Spark (only 2 ConnectX-7 ports per node). Ring topology is the only option for 4-node Spark clusters.
+A non-neighbor direct address is not expected to be reachable in a sparse ring.
 
-## Line Topology
+Verify that every host can reach every other host on the management network.
 
-For scenarios where ring cabling isn't possible, line topology is also supported:
+## Verify RoCE
 
-### Line Topology (4 Nodes)
+Inspect GIDs:
 
+```bash
+show_gids
+# or
+for f in /sys/class/infiniband/*/ports/1/gids/*; do
+  printf '%s: ' "$f"
+  cat "$f"
+done
 ```
-Node A ---- Node B ---- Node C ---- Node D
-  NIC1      NIC1 NIC2   NIC1 NIC2     NIC1
-   |          |    |      |    |        |
-  192.168.100.x   192.168.101.x   192.168.102.x
+
+Run an RDMA bandwidth test on every cable in both directions. Use the verbs
+device and GID index that correspond to that link.
+
+Do not proceed to NCCL until the point-to-point RDMA tools are stable.
+
+## Build and distribute the plugin
+
+```bash
+make clean
+make test-deps
+make -j"$(nproc)"
+make test
+sha256sum libnccl-net.so
 ```
 
-### Line IP Address Assignment
+Copy the same AArch64 build to every Spark and verify the checksum on all hosts.
 
-| Link | Subnet | Node A | Node B | Node C | Node D |
-|------|--------|--------|--------|--------|--------|
-| A↔B | 192.168.100.0/24 | .2 | .3 | - | - |
-| B↔C | 192.168.101.0/24 | - | .2 | .3 | - |
-| C↔D | 192.168.102.0/24 | - | - | .2 | .3 |
+Example:
 
-### Line Communication Patterns
+```bash
+for host in spark-a spark-b spark-c spark-d; do
+  ssh "$host" 'sha256sum ~/.cache/huggingface/nccl-mesh/libnccl-net.so'
+done
+```
 
-| Source | Destination | Hops | Path |
-|--------|-------------|------|------|
-| A | B | 1 | Direct |
-| A | C | 2 | A→B→C |
-| A | D | 3 | A→B→C→D |
-| B | D | 2 | B→C→D |
+The August 2026 validated binary hash was:
 
-Endpoints (A and D) have only 1 NIC; middle nodes need 2 NICs.
+```text
+717b613b8557f629c0a77161559fd6acd1e9a36b0f5b4dac36458ac64b5ec4c1
+```
 
-## Reference: DGX Spark Mesh
+A future build will have a different hash; what matters is exact equality across
+the participating hosts.
 
-Our tested configuration:
+## Runtime environment
 
-| Hostname | Management IP | Mesh IPs |
-|----------|--------------|----------|
-| titanic (A) | 10.0.0.170 | 192.168.100.2, 192.168.101.2 |
-| iceberg (B) | 10.0.0.171 | 192.168.101.3, 192.168.102.2 |
-| carpathia (C) | 10.0.0.172 | 192.168.100.3, 192.168.102.3 |
+Basic plugin selection:
+
+```bash
+export NCCL_NET_PLUGIN=/path/visible/to/the/runtime/libnccl-net.so
+export NCCL_NET=Mesh
+export NCCL_SOCKET_IFNAME='=enP7s7'
+export NCCL_SOCKET_FAMILY=AF_INET
+```
+
+Sparse ring policy:
+
+```bash
+export NCCL_ALGO=Ring
+export NCCL_MESH_HYBRID_TCP=1
+```
+
+Recommended diagnostics during bring-up:
+
+```bash
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,NET
+export NCCL_MESH_DEBUG=1
+```
+
+Production startup profile validated with the four-node vLLM workload:
+
+```bash
+export NCCL_MESH_FAST_FAIL=0
+export NCCL_MESH_TIMEOUT_SEC=900
+export NCCL_MESH_FATAL_ON_TIMEOUT=1
+export NCCL_MESH_METRICS=0
+```
+
+`NCCL_SOCKET_IFNAME` must name the all-reachable management interface. Do not
+pin it to one point-to-point RoCE interface.
+
+## Rank order
+
+Keep the distributed rank order aligned with the cable order:
+
+```text
+rank 0: spark-a
+rank 1: spark-b
+rank 2: spark-c
+rank 3: spark-d
+```
+
+That makes the primary NCCL ring edges physical neighbors.
+
+Hybrid mode handles non-neighbor connections that NCCL may construct for tree or
+shortcut setup. It does not make arbitrary rank orders equally efficient.
+
+## Validation sequence
+
+Use this order so failures stay local and diagnosable:
+
+1. IP ping across each physical cable.
+2. Point-to-point RDMA tool across each cable.
+3. Plugin unit and topology tests.
+4. Adjacent two-rank NCCL transfer with RDMA.
+5. Diagonal two-rank transfer with hybrid TCP.
+6. Four-node NCCL collective benchmark.
+7. Exact production runtime startup.
+8. Small inference request.
+9. Sustained benchmark matrix.
+
+## Expected transport evidence
+
+Adjacent pair:
+
+```text
+transport=RDMA
+```
+
+Diagonal pair with hybrid enabled:
+
+```text
+selecting hybrid TCP
+transport=TCP
+```
+
+At connection close, inspect:
+
+- transport kind;
+- operation count;
+- bytes;
+- error count.
+
+In the validated four-node NCCL 2.30.4 benchmark, diagonal TCP connections
+carried only setup/control-scale bytes while the bulk collective path stayed on
+RDMA.
+
+## Container deployment
+
+A runtime container must see:
+
+- the same plugin binary;
+- the selected NCCL library;
+- the shared management interface;
+- the direct RoCE interfaces;
+- a writable location for optional NCCL debug files.
+
+With sparkrun, a practical shared convention is:
+
+```text
+host:      ~/.cache/huggingface/nccl-mesh/libnccl-net.so
+container: /cache/huggingface/nccl-mesh/libnccl-net.so
+```
+
+Verify the path inside the worker container before launching the full workload.
+
+## GID changes during a job
+
+Warnings such as:
+
+```text
+NET/IB: <device>:1 GID table changed
+```
+
+indicate interface/GID churn. Check for:
+
+- NetworkManager or netplan reapplying addresses;
+- interface reset or link flap;
+- duplicate address configuration;
+- scripts modifying the direct interfaces during the run.
+
+Stable direct-link addressing is required for reliable QP operation.
+
+## Firewall
+
+Allow the NCCL bootstrap and plugin listener traffic on the trusted management
+network. The plugin uses dynamically allocated listener ports; a narrow fixed
+port range is not currently documented by the implementation.
+
+For initial isolated-lab testing, validate with host firewalls accounted for
+rather than guessing a port range.
+
+## Safety notes
+
+- Never copy a personal GitHub token or workstation private SSH key onto every
+  cluster node.
+- Use a dedicated deploy key, short-lived credential, or stage source/artifacts
+  from an authenticated workstation.
+- Publish only private-address examples and redacted logs.
