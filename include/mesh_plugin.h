@@ -18,6 +18,8 @@
 #define MESH_MAX_QPS 256
 #define MESH_MAX_MRS 1024
 #define MESH_HANDLE_MAGIC 0x4D455348  // "MESH"
+#define MESH_HANDLE_VERSION 1U
+#define MESH_HANDLE_FLAG_HYBRID_TCP 0x01U
 
 // Connection pool settings (TICKET-6)
 #define MESH_CONN_POOL_SIZE 64        // Max pooled connections per NIC
@@ -212,8 +214,17 @@ struct mesh_handle {
     uint32_t handshake_ip;      // IP address for handshake (network byte order)
     union ibv_gid gid;          // GID (16 bytes)
     struct mesh_addr_entry addrs[MESH_MAX_ADDRS];  // 12 bytes each
-    // Total: 4+1+1+2+2+2+1+1+4+4+16 + 6*12 = 38 + 72 = 110 bytes (fits in 128)
+
+    // Gate 1.5: separately advertised management TCP endpoint. It is never
+    // considered by RDMA subnet selection.
+    uint32_t hybrid_tcp_ip;       // Management IP (network byte order)
+    uint16_t hybrid_tcp_port;     // Management TCP data-listener port
+    uint8_t  version;             // MESH_HANDLE_VERSION
+    uint8_t  flags;               // MESH_HANDLE_FLAG_*
 };
+
+_Static_assert(sizeof(struct mesh_handle) <= 128,
+               "mesh_handle must fit in NCCL's 128-byte network handle");
 
 /*
  * Listen state - waiting for incoming connections
@@ -257,6 +268,11 @@ struct mesh_listen_comm {
     int handshake_sock;
     uint16_t handshake_port;
     uint32_t handshake_ip;
+
+    // Gate 1.5: optional management TCP listener owned by this mixed listener.
+    int hybrid_tcp_sock;
+    uint16_t hybrid_tcp_port;
+    uint32_t hybrid_tcp_ip;
     
     // Background handshake thread
     pthread_t handshake_thread;
@@ -299,6 +315,10 @@ struct mesh_send_comm {
     struct mesh_async_connect_req *async_req; // Pending async connect request
     int connect_pending;        // 1 if waiting for async connect to complete
 
+    // Per-logical-connection traffic accounting (payload bytes only).
+    uint64_t send_ops;
+    uint64_t bytes_sent;
+
     // Request tracking
     struct mesh_request *requests[MESH_MAX_QPS];
     int num_requests;
@@ -319,6 +339,10 @@ struct mesh_recv_comm {
     // NCCL-001: Connection age and peer identity for structured error logging
     struct timespec conn_established_time;  // When QP reached RTS
     uint32_t peer_ip;           // Peer IP for error logging
+
+    // Per-logical-connection traffic accounting (payload bytes only).
+    uint64_t recv_ops;
+    uint64_t bytes_recv;
 
     // Request tracking
     struct mesh_request *requests[MESH_MAX_QPS];
@@ -362,6 +386,10 @@ struct mesh_tcp_send_comm {
     int last_errno;
     uint64_t error_count;
 
+    // Per-logical-connection traffic accounting (payload bytes only).
+    uint64_t send_ops;
+    uint64_t bytes_sent;
+
     // Buffer for message framing
     uint8_t send_hdr[8];        // Size header for message framing
 
@@ -381,6 +409,10 @@ struct mesh_tcp_recv_comm {
     int peer_failed;
     int last_errno;
     uint64_t error_count;
+
+    // Per-logical-connection traffic accounting (payload bytes only).
+    uint64_t recv_ops;
+    uint64_t bytes_recv;
 
     // Buffer for message framing
     uint8_t recv_hdr[8];        // Size header for message framing
@@ -520,6 +552,12 @@ struct mesh_plugin_state {
     int retry_count;            // NCCL_MESH_RETRY_COUNT: retry attempts (default: 3)
     int disable_rdma;           // NCCL_MESH_DISABLE_RDMA: force TCP fallback
 
+    // Gate 1.5: opt-in per-connection management TCP for non-adjacent peers.
+    int hybrid_tcp_enabled;
+    uint32_t hybrid_tcp_ip;      // Host byte order
+    uint32_t hybrid_tcp_netmask; // Host byte order
+    char hybrid_tcp_ifname[64];
+
     // Connection pooling config (TICKET-6)
     int enable_conn_pool;       // NCCL_MESH_CONN_POOL: enable connection pooling (default: 1)
 
@@ -648,10 +686,14 @@ const char* mesh_find_netdev_for_rdma(const char *rdma_dev);
 
 // Logging macros
 // NCCL_MESH_DEBUG levels: 0=off, 1=info/errors, 2=verbose/trace
+// NCCL_NET is the NCCL debug subsystem bit for network transport logs.
+#define MESH_NCCL_LOG_SUBSYS_NET 0x10UL
+
 #define MESH_LOG(level, fmt, ...) \
     do { \
         if (g_mesh_state.log_fn) { \
-            g_mesh_state.log_fn(level, 0, __FILE__, __LINE__, fmt, ##__VA_ARGS__); \
+            g_mesh_state.log_fn(level, MESH_NCCL_LOG_SUBSYS_NET, \
+                                __FILE__, __LINE__, fmt, ##__VA_ARGS__); \
         } \
     } while(0)
 

@@ -83,6 +83,39 @@ static void test_request_header(void) {
         atomic_load(&request.header.state)));
 }
 
+static void test_hybrid_handle_layout(void) {
+    struct mesh_handle handle;
+    memset(&handle, 0, sizeof(handle));
+
+    handle.magic = MESH_HANDLE_MAGIC;
+    handle.version = MESH_HANDLE_VERSION;
+    handle.flags = MESH_HANDLE_FLAG_HYBRID_TCP;
+    handle.hybrid_tcp_ip = 0x0100000aU;
+    handle.hybrid_tcp_port = 12345;
+
+    CHECK(sizeof(handle) <= 128);
+    CHECK(handle.version == MESH_HANDLE_VERSION);
+    CHECK(handle.flags & MESH_HANDLE_FLAG_HYBRID_TCP);
+    CHECK(handle.hybrid_tcp_port == 12345);
+}
+
+static void test_connection_counters(void) {
+    struct mesh_tcp_send_comm tcp_send;
+    struct mesh_recv_comm rdma_recv;
+    memset(&tcp_send, 0, sizeof(tcp_send));
+    memset(&rdma_recv, 0, sizeof(rdma_recv));
+
+    tcp_send.send_ops = 3;
+    tcp_send.bytes_sent = 4096;
+    rdma_recv.recv_ops = 4;
+    rdma_recv.bytes_recv = 8192;
+
+    CHECK(tcp_send.send_ops == 3);
+    CHECK(tcp_send.bytes_sent == 4096);
+    CHECK(rdma_recv.recv_ops == 4);
+    CHECK(rdma_recv.bytes_recv == 8192);
+}
+
 static void test_tcp_request_kind(void) {
     struct mesh_tcp_request request;
     memset(&request, 0, sizeof(request));
@@ -96,6 +129,8 @@ int main(void) {
     test_layouts();
     test_object_validation();
     test_request_header();
+    test_hybrid_handle_layout();
+    test_connection_counters();
     test_tcp_request_kind();
 
     if (failures) {

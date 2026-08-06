@@ -1577,6 +1577,249 @@ int mesh_async_connect_poll(struct mesh_async_connect_req *req) {
  */
 
 /*
+ * Gate 1.5 management TCP helpers.
+ *
+ * Hybrid mode deliberately keeps management addressing outside g_mesh_state.nics
+ * so the management interface can never be selected as an RDMA transport.
+ */
+static int mesh_socket_ifname_matches(const char *filter, const char *if_name) {
+    if (!filter || !filter[0] || !if_name) return 0;
+
+    int exact = 0;
+    if (filter[0] == '=') {
+        exact = 1;
+        filter++;
+    }
+    if (filter[0] == '^') return 0;
+
+    size_t len = strcspn(filter, ",");
+    if (len == 0) return 0;
+    if (strncmp(if_name, filter, len) != 0) return 0;
+    return !exact || if_name[len] == '\0';
+}
+
+static int mesh_discover_hybrid_management_interface(void) {
+    const char *filter = getenv("NCCL_SOCKET_IFNAME");
+    if (!filter || !filter[0]) {
+        MESH_WARN("NCCL_MESH_HYBRID_TCP=1 requires NCCL_SOCKET_IFNAME");
+        return -1;
+    }
+
+    struct ifaddrs *ifaddr = NULL;
+    if (getifaddrs(&ifaddr) != 0) {
+        MESH_WARN("Hybrid TCP: getifaddrs failed: %s", strerror(errno));
+        return -1;
+    }
+
+    int found = 0;
+    for (struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        if ((ifa->ifa_flags & IFF_LOOPBACK) || !(ifa->ifa_flags & IFF_UP)) continue;
+        if (!mesh_socket_ifname_matches(filter, ifa->ifa_name)) continue;
+
+        struct sockaddr_in *addr = (struct sockaddr_in *)ifa->ifa_addr;
+        struct sockaddr_in *mask = (struct sockaddr_in *)ifa->ifa_netmask;
+        g_mesh_state.hybrid_tcp_ip = ntohl(addr->sin_addr.s_addr);
+        g_mesh_state.hybrid_tcp_netmask = ntohl(mask->sin_addr.s_addr);
+        strncpy(g_mesh_state.hybrid_tcp_ifname, ifa->ifa_name,
+                sizeof(g_mesh_state.hybrid_tcp_ifname) - 1);
+        g_mesh_state.hybrid_tcp_ifname[
+            sizeof(g_mesh_state.hybrid_tcp_ifname) - 1] = '\0';
+        found = 1;
+        break;
+    }
+    freeifaddrs(ifaddr);
+
+    if (!found) {
+        MESH_WARN("Hybrid TCP: no active IPv4 interface matched NCCL_SOCKET_IFNAME=%s",
+                  filter);
+        return -1;
+    }
+
+    char ip_str[INET_ADDRSTRLEN];
+    mesh_uint_to_ip(g_mesh_state.hybrid_tcp_ip, ip_str, sizeof(ip_str));
+    MESH_LOG(NCCL_LOG_INFO,
+             "MESH Hybrid TCP management endpoint: if=%s ip=%s",
+             g_mesh_state.hybrid_tcp_ifname, ip_str);
+    return 0;
+}
+
+static int mesh_configure_tcp_socket(int sock) {
+    int opt = 1;
+    if (setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) != 0) {
+        MESH_WARN("TCP: setsockopt(TCP_NODELAY) failed: %s", strerror(errno));
+        return -1;
+    }
+    if (setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt)) != 0) {
+        MESH_WARN("TCP: setsockopt(SO_KEEPALIVE) failed: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int mesh_create_tcp_listener(uint32_t bind_ip, uint16_t *port_out,
+                                    int nonblocking) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+
+    int opt = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = bind_ip ? htonl(bind_ip) : INADDR_ANY;
+    addr.sin_port = 0;
+
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(sock, 64) != 0) {
+        int saved_errno = errno;
+        close(sock);
+        errno = saved_errno;
+        return -1;
+    }
+
+    socklen_t addrlen = sizeof(addr);
+    if (getsockname(sock, (struct sockaddr *)&addr, &addrlen) != 0) {
+        int saved_errno = errno;
+        close(sock);
+        errno = saved_errno;
+        return -1;
+    }
+
+    if (nonblocking) {
+        int flags = fcntl(sock, F_GETFL, 0);
+        if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) != 0) {
+            int saved_errno = errno;
+            close(sock);
+            errno = saved_errno;
+            return -1;
+        }
+    }
+
+    *port_out = ntohs(addr.sin_port);
+    return sock;
+}
+
+static ncclResult_t mesh_tcp_connect_endpoint(
+        uint32_t local_ip, uint32_t remote_ip, uint16_t remote_port,
+        const char *context, void **sendComm,
+        ncclNetDeviceHandle_t **sendDevComm) {
+    int sock = -1;
+    int retries = g_mesh_state.retry_count;
+    int retry_delay_ms = 100;
+    int last_errno = 0;
+
+    while (retries-- > 0) {
+        sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            last_errno = errno;
+            break;
+        }
+        if (mesh_configure_tcp_socket(sock) != 0) {
+            last_errno = errno;
+            close(sock);
+            sock = -1;
+            break;
+        }
+
+        if (local_ip) {
+            struct sockaddr_in local_addr;
+            memset(&local_addr, 0, sizeof(local_addr));
+            local_addr.sin_family = AF_INET;
+            local_addr.sin_addr.s_addr = htonl(local_ip);
+            local_addr.sin_port = 0;
+            if (bind(sock, (struct sockaddr *)&local_addr,
+                     sizeof(local_addr)) != 0) {
+                last_errno = errno;
+                close(sock);
+                sock = -1;
+                break;
+            }
+        }
+
+        struct sockaddr_in remote_addr;
+        memset(&remote_addr, 0, sizeof(remote_addr));
+        remote_addr.sin_family = AF_INET;
+        remote_addr.sin_addr.s_addr = htonl(remote_ip);
+        remote_addr.sin_port = htons(remote_port);
+
+        if (connect(sock, (struct sockaddr *)&remote_addr,
+                    sizeof(remote_addr)) == 0) {
+            break;
+        }
+
+        last_errno = errno;
+        close(sock);
+        sock = -1;
+        if (retries <= 0 ||
+            !(last_errno == ECONNREFUSED || last_errno == ETIMEDOUT ||
+              last_errno == ECONNRESET || last_errno == ENETUNREACH ||
+              last_errno == EHOSTUNREACH)) {
+            break;
+        }
+        usleep((useconds_t)retry_delay_ms * 1000U);
+        if (retry_delay_ms < 1600) retry_delay_ms *= 2;
+    }
+
+    if (sock < 0) {
+        char ip_str[INET_ADDRSTRLEN];
+        mesh_uint_to_ip(remote_ip, ip_str, sizeof(ip_str));
+        MESH_WARN("%s: failed to connect to %s:%u: %s", context,
+                  ip_str, remote_port, strerror(last_errno ? last_errno : errno));
+        return ncclSystemError;
+    }
+
+    struct mesh_tcp_send_comm *comm = calloc(1, sizeof(*comm));
+    if (!comm) {
+        close(sock);
+        return ncclSystemError;
+    }
+    mesh_object_init(&comm->object, MESH_OBJ_SEND_TCP);
+    comm->sock = sock;
+    comm->remote_ip = remote_ip;
+    comm->remote_port = remote_port;
+    comm->connected = 1;
+
+    char ip_str[INET_ADDRSTRLEN];
+    mesh_uint_to_ip(remote_ip, ip_str, sizeof(ip_str));
+    MESH_LOG(NCCL_LOG_INFO, "MESH %s: connected to %s:%u",
+             context, ip_str, remote_port);
+
+    *sendComm = comm;
+    if (sendDevComm) *sendDevComm = NULL;
+    return ncclSuccess;
+}
+
+static ncclResult_t mesh_tcp_finish_accept(
+        int conn_sock, const struct sockaddr_in *peer_addr, const char *context,
+        void **recvComm, ncclNetDeviceHandle_t **recvDevComm) {
+    if (mesh_configure_tcp_socket(conn_sock) != 0) {
+        close(conn_sock);
+        return ncclSystemError;
+    }
+
+    struct mesh_tcp_recv_comm *comm = calloc(1, sizeof(*comm));
+    if (!comm) {
+        close(conn_sock);
+        return ncclSystemError;
+    }
+    mesh_object_init(&comm->object, MESH_OBJ_RECV_TCP);
+    comm->sock = conn_sock;
+    comm->remote_ip = ntohl(peer_addr->sin_addr.s_addr);
+    comm->connected = 1;
+
+    char ip_str[INET_ADDRSTRLEN];
+    mesh_uint_to_ip(comm->remote_ip, ip_str, sizeof(ip_str));
+    MESH_LOG(NCCL_LOG_INFO, "MESH %s: accepted connection from %s",
+             context, ip_str);
+
+    *recvComm = comm;
+    if (recvDevComm) *recvDevComm = NULL;
+    return ncclSuccess;
+}
+
+/*
  * Initialize TCP fallback mode
  * Called when RDMA init fails or is disabled
  */
@@ -1711,6 +1954,7 @@ static ncclResult_t mesh_tcp_listen_impl(int dev, void *handle, void **listenCom
     // Fill handle for peer
     memset(h, 0, sizeof(*h));
     h->magic = MESH_HANDLE_MAGIC;
+    h->version = MESH_HANDLE_VERSION;
     h->handshake_port = comm->listen_port;
     h->num_addrs = 0;
 
@@ -1744,111 +1988,31 @@ static ncclResult_t mesh_tcp_connect_impl(int dev, void *opaqueHandle, void **se
     (void)dev;
 
     struct mesh_handle *handle = (struct mesh_handle *)opaqueHandle;
-    struct mesh_tcp_send_comm *comm;
     struct mesh_nic *nic = NULL;
     struct mesh_addr_entry *selected_addr = NULL;
 
-    if (handle->magic != MESH_HANDLE_MAGIC) {
+    if (!handle || handle->magic != MESH_HANDLE_MAGIC) {
         MESH_WARN("TCP connect: Invalid handle magic");
         return ncclInvalidArgument;
     }
 
-    // Find a peer address we can reach
     for (int i = 0; i < handle->num_addrs; i++) {
-        struct mesh_addr_entry *addr = &handle->addrs[i];
-        uint32_t peer_ip = ntohl(addr->ip);
-
+        uint32_t peer_ip = ntohl(handle->addrs[i].ip);
         nic = mesh_find_nic_for_ip(peer_ip);
         if (nic) {
-            selected_addr = addr;
+            selected_addr = &handle->addrs[i];
             break;
         }
     }
 
-    if (!nic || !selected_addr) {
-        MESH_WARN("TCP connect: No matching interface for peer");
+    if (!nic || !selected_addr || handle->handshake_port == 0) {
+        MESH_WARN("TCP connect: No matching interface or endpoint for peer");
         return ncclSystemError;
     }
 
-    comm = calloc(1, sizeof(*comm));
-    if (!comm) {
-        return ncclSystemError;
-    }
-    mesh_object_init(&comm->object, MESH_OBJ_SEND_TCP);
-
-    // Create and connect socket
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        MESH_WARN("TCP connect: Failed to create socket: %s", strerror(errno));
-        free(comm);
-        return ncclSystemError;
-    }
-
-    // TICKET-E: Set TCP_NODELAY for low latency and SO_KEEPALIVE for dead peer detection
-    int opt = 1;
-    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = selected_addr->ip;  // Already in network byte order
-    addr.sin_port = htons(handle->handshake_port);
-
-    // Retry connection with timeout
-    int connected = 0;
-    int retries = g_mesh_state.retry_count;
-    int retry_delay_ms = 100;
-
-    // TICKET-E: Retry on transient TCP failures (connection refused, timeout, reset)
-    while (retries > 0 && !connected) {
-        if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-            connected = 1;
-        } else if (errno == ECONNREFUSED || errno == ETIMEDOUT ||
-                   errno == ECONNRESET || errno == ENETUNREACH ||
-                   errno == EHOSTUNREACH) {
-            retries--;
-            if (retries > 0) {
-                MESH_DEBUG("TCP connect: retrying in %dms (errno=%d: %s, %d retries left)",
-                           retry_delay_ms, errno, strerror(errno), retries);
-                usleep(retry_delay_ms * 1000);
-                retry_delay_ms *= 2;
-                // Recreate socket for retry since connect() on a failed socket
-                // may not work on all platforms
-                close(sock);
-                sock = socket(AF_INET, SOCK_STREAM, 0);
-                if (sock < 0) break;
-                int reopt = 1;
-                setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &reopt, sizeof(reopt));
-                setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &reopt, sizeof(reopt));
-            }
-        } else {
-            break;
-        }
-    }
-
-    if (!connected) {
-        char ip_str[INET_ADDRSTRLEN];
-        mesh_uint_to_ip(ntohl(selected_addr->ip), ip_str, sizeof(ip_str));
-        MESH_WARN("TCP connect: Failed to connect to %s:%d: %s",
-                  ip_str, handle->handshake_port, strerror(errno));
-        close(sock);
-        free(comm);
-        return ncclSystemError;
-    }
-
-    comm->sock = sock;
-    comm->remote_ip = ntohl(selected_addr->ip);
-    comm->remote_port = handle->handshake_port;
-    comm->connected = 1;
-
-    char ip_str[INET_ADDRSTRLEN];
-    mesh_uint_to_ip(comm->remote_ip, ip_str, sizeof(ip_str));
-    MESH_INFO("TCP connect: Connected to %s:%d", ip_str, comm->remote_port);
-
-    *sendComm = comm;
-    if (sendDevComm) *sendDevComm = NULL;
-    return ncclSuccess;
+    return mesh_tcp_connect_endpoint(
+        nic->ip_addr, ntohl(selected_addr->ip), handle->handshake_port,
+        "TCP connect", sendComm, sendDevComm);
 }
 
 /*
@@ -1856,63 +2020,41 @@ static ncclResult_t mesh_tcp_connect_impl(int dev, void *opaqueHandle, void **se
  */
 static ncclResult_t mesh_tcp_accept_impl(void *listenComm, void **recvComm,
                                          ncclNetDeviceHandle_t **recvDevComm) {
-    struct mesh_tcp_listen_comm *lcomm = (struct mesh_tcp_listen_comm *)listenComm;
-    struct mesh_tcp_recv_comm *comm;
-    struct sockaddr_in addr;
-    socklen_t addrlen = sizeof(addr);
+    struct mesh_tcp_listen_comm *lcomm =
+        (struct mesh_tcp_listen_comm *)listenComm;
+    if (!lcomm || lcomm->listen_sock < 0) return ncclInvalidArgument;
 
-    comm = calloc(1, sizeof(*comm));
-    if (!comm) {
+    int flags = fcntl(lcomm->listen_sock, F_GETFL, 0);
+    if (flags < 0 ||
+        fcntl(lcomm->listen_sock, F_SETFL, flags | O_NONBLOCK) != 0) {
         return ncclSystemError;
     }
-    mesh_object_init(&comm->object, MESH_OBJ_RECV_TCP);
 
-    // Set socket to non-blocking for timeout handling
-    int flags = fcntl(lcomm->listen_sock, F_GETFL, 0);
-    fcntl(lcomm->listen_sock, F_SETFL, flags | O_NONBLOCK);
-
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
     int conn_sock = -1;
-    int timeout_ms = g_mesh_state.timeout_ms * 6;  // Same as RDMA accept timeout
+    int timeout_ms = g_mesh_state.timeout_ms * 6;
     int elapsed = 0;
 
     while (elapsed < timeout_ms) {
-        conn_sock = accept(lcomm->listen_sock, (struct sockaddr *)&addr, &addrlen);
-        if (conn_sock >= 0) {
-            break;
-        }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            usleep(10000);  // 10ms
-            elapsed += 10;
-        } else {
-            break;
-        }
+        conn_sock = accept(lcomm->listen_sock,
+                           (struct sockaddr *)&addr, &addrlen);
+        if (conn_sock >= 0) break;
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+        usleep(10000);
+        elapsed += 10;
     }
-
-    // Restore blocking mode
     fcntl(lcomm->listen_sock, F_SETFL, flags);
 
     if (conn_sock < 0) {
-        MESH_WARN("TCP accept: Failed to accept connection: %s", strerror(errno));
-        free(comm);
+        MESH_WARN("TCP accept: Failed to accept connection: %s",
+                  strerror(errno));
         return ncclSystemError;
     }
 
-    // TICKET-E: Set TCP_NODELAY and SO_KEEPALIVE for dead peer detection
-    int opt = 1;
-    setsockopt(conn_sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-    setsockopt(conn_sock, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
-
-    comm->sock = conn_sock;
-    comm->remote_ip = ntohl(addr.sin_addr.s_addr);
-    comm->connected = 1;
-
-    char ip_str[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &addr.sin_addr, ip_str, sizeof(ip_str));
-    MESH_INFO("TCP accept: Accepted connection from %s", ip_str);
-
-    *recvComm = comm;
-    if (recvDevComm) *recvDevComm = NULL;
-    return ncclSuccess;
+    return mesh_tcp_finish_accept(conn_sock, &addr, "TCP accept",
+                                  recvComm, recvDevComm);
 }
 
 /*
@@ -1976,6 +2118,7 @@ static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag
     req->offset = 0;
     req->header_sent = 0;
     req->next = NULL;
+    __atomic_fetch_add(&comm->send_ops, 1, __ATOMIC_RELAXED);
 
     // TICKET-10: Enqueue request in FIFO queue
     // TCP sends data in-order, so we process requests in FIFO order
@@ -2042,6 +2185,7 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
     req->header_recvd = 0;
     req->msg_size = 0;
     req->next = NULL;
+    __atomic_fetch_add(&comm->recv_ops, 1, __ATOMIC_RELAXED);
 
     // TICKET-10: Enqueue request in FIFO queue
     // TCP delivers data in-order, so we process requests in FIFO order
@@ -2257,8 +2401,10 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                 free(req);
                 return ncclSystemError;
             }
-            req->offset += recvd;
-            test_recv_progress += recvd;
+            req->offset += (size_t)recvd;
+            test_recv_progress += (uint64_t)recvd;
+            __atomic_fetch_add(&comm->bytes_recv, (uint64_t)recvd,
+                               __ATOMIC_RELAXED);
         }
 
         // Check if all data received
@@ -2379,8 +2525,10 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                 free(req);
                 return ncclSystemError;
             }
-            req->offset += sent;
-            test_send_progress += sent;
+            req->offset += (size_t)sent;
+            test_send_progress += (uint64_t)sent;
+            __atomic_fetch_add(&comm->bytes_sent, (uint64_t)sent,
+                               __ATOMIC_RELAXED);
         }
 
         // Check if all data sent
@@ -2439,16 +2587,29 @@ static ncclResult_t mesh_tcp_closeSend(void *sendComm) {
     struct mesh_tcp_send_comm *comm = (struct mesh_tcp_send_comm *)sendComm;
 
     if (comm) {
-        // TICKET-E: Drain pending send queue to prevent memory leaks
         struct mesh_tcp_request *req = comm->send_queue_head;
         while (req) {
             struct mesh_tcp_request *next = req->next;
-            __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1,
+                               __ATOMIC_RELAXED);
             free(req);
             req = next;
         }
         comm->send_queue_head = NULL;
         comm->send_queue_tail = NULL;
+
+        char ip_str[INET_ADDRSTRLEN];
+        mesh_uint_to_ip(comm->remote_ip, ip_str, sizeof(ip_str));
+        MESH_LOG(NCCL_LOG_INFO,
+                 "MESH connection-summary transport=tcp direction=send "
+                 "peer=%s ops=%lu bytes=%lu errors=%lu",
+                 ip_str,
+                 (unsigned long)__atomic_load_n(&comm->send_ops,
+                                                 __ATOMIC_RELAXED),
+                 (unsigned long)__atomic_load_n(&comm->bytes_sent,
+                                                 __ATOMIC_RELAXED),
+                 (unsigned long)__atomic_load_n(&comm->error_count,
+                                                 __ATOMIC_RELAXED));
 
         if (comm->sock >= 0) {
             shutdown(comm->sock, SHUT_RDWR);
@@ -2456,7 +2617,6 @@ static ncclResult_t mesh_tcp_closeSend(void *sendComm) {
         }
         free(comm);
     }
-
     return ncclSuccess;
 }
 
@@ -2467,16 +2627,29 @@ static ncclResult_t mesh_tcp_closeRecv(void *recvComm) {
     struct mesh_tcp_recv_comm *comm = (struct mesh_tcp_recv_comm *)recvComm;
 
     if (comm) {
-        // TICKET-E: Drain pending recv queue to prevent memory leaks
         struct mesh_tcp_request *req = comm->recv_queue_head;
         while (req) {
             struct mesh_tcp_request *next = req->next;
-            __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1,
+                               __ATOMIC_RELAXED);
             free(req);
             req = next;
         }
         comm->recv_queue_head = NULL;
         comm->recv_queue_tail = NULL;
+
+        char ip_str[INET_ADDRSTRLEN];
+        mesh_uint_to_ip(comm->remote_ip, ip_str, sizeof(ip_str));
+        MESH_LOG(NCCL_LOG_INFO,
+                 "MESH connection-summary transport=tcp direction=recv "
+                 "peer=%s ops=%lu bytes=%lu errors=%lu",
+                 ip_str,
+                 (unsigned long)__atomic_load_n(&comm->recv_ops,
+                                                 __ATOMIC_RELAXED),
+                 (unsigned long)__atomic_load_n(&comm->bytes_recv,
+                                                 __ATOMIC_RELAXED),
+                 (unsigned long)__atomic_load_n(&comm->error_count,
+                                                 __ATOMIC_RELAXED));
 
         if (comm->sock >= 0) {
             shutdown(comm->sock, SHUT_RDWR);
@@ -2484,7 +2657,6 @@ static ncclResult_t mesh_tcp_closeRecv(void *recvComm) {
         }
         free(comm);
     }
-
     return ncclSuccess;
 }
 
@@ -2870,6 +3042,10 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
     env_val = getenv("NCCL_MESH_DISABLE_RDMA");
     g_mesh_state.disable_rdma = env_val ? atoi(env_val) : 0;
 
+    // NCCL_MESH_HYBRID_TCP: use management TCP only when no RDMA subnet matches.
+    env_val = getenv("NCCL_MESH_HYBRID_TCP");
+    g_mesh_state.hybrid_tcp_enabled = env_val ? atoi(env_val) : 0;
+
     // NCCL_MESH_CONN_POOL: Enable connection pooling (default: 1) (TICKET-6)
     env_val = getenv("NCCL_MESH_CONN_POOL");
     g_mesh_state.enable_conn_pool = env_val ? atoi(env_val) : 1;
@@ -2917,10 +3093,11 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
 
     // Log configuration (always shown at init, regardless of debug level)
     MESH_LOG(NCCL_LOG_INFO, "MESH Initializing: gid=%d debug=%d fast_fail=%d timeout=%dms retries=%d "
-             "disable_rdma=%d conn_pool=%d async_connect=%d",
+             "disable_rdma=%d hybrid_tcp=%d conn_pool=%d async_connect=%d",
              g_mesh_state.gid_index, g_mesh_state.debug_level, g_mesh_state.fast_fail,
              g_mesh_state.timeout_ms, g_mesh_state.retry_count, g_mesh_state.disable_rdma,
-             g_mesh_state.enable_conn_pool, g_mesh_state.enable_async_connect);
+             g_mesh_state.hybrid_tcp_enabled, g_mesh_state.enable_conn_pool,
+             g_mesh_state.enable_async_connect);
     MESH_LOG(NCCL_LOG_INFO, "MESH Error hardening: op_timeout=%ds connect_timeout=%ds "
              "accept_timeout=%ds health_check=%dms fatal_on_timeout=%d",
              g_mesh_state.op_timeout_sec, g_mesh_state.connect_timeout_sec,
@@ -2962,6 +3139,13 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
         g_mesh_state.initialized = 1;
         MESH_INFO("Mesh plugin initialized in TCP fallback mode with %d interfaces", g_mesh_state.num_nics);
         return ncclSuccess;
+    }
+
+    if (g_mesh_state.hybrid_tcp_enabled) {
+        if (mesh_discover_hybrid_management_interface() != 0) {
+            MESH_WARN("Hybrid TCP initialization failed");
+            return ncclSystemError;
+        }
     }
 
     // Initialize connection pool if enabled (TICKET-6)
@@ -3061,6 +3245,7 @@ static ncclResult_t mesh_listen(int dev, void *handle, void **listenComm) {
     comm->num_qps = 0;
     comm->psn = 0;
     comm->handshake_sock = -1;
+    comm->hybrid_tcp_sock = -1;
     
     // Create QP on EACH NIC
     for (int i = 0; i < g_mesh_state.num_nics && i < MESH_MAX_NICS; i++) {
@@ -3096,6 +3281,23 @@ static ncclResult_t mesh_listen(int dev, void *handle, void **listenComm) {
         MESH_WARN("Failed to create handshake socket");
         // Continue without handshake - will fail at accept
     }
+
+    if (g_mesh_state.hybrid_tcp_enabled) {
+        comm->hybrid_tcp_ip = g_mesh_state.hybrid_tcp_ip;
+        comm->hybrid_tcp_sock = mesh_create_tcp_listener(
+            comm->hybrid_tcp_ip, &comm->hybrid_tcp_port, 1);
+        if (comm->hybrid_tcp_sock < 0) {
+            MESH_WARN("Hybrid TCP listen: failed on %s: %s",
+                      g_mesh_state.hybrid_tcp_ifname, strerror(errno));
+            if (comm->handshake_sock >= 0) close(comm->handshake_sock);
+            for (int i = 0; i < comm->num_qps; i++) {
+                if (comm->qps[i].qp) ibv_destroy_qp(comm->qps[i].qp);
+                if (comm->qps[i].cq) ibv_destroy_cq(comm->qps[i].cq);
+            }
+            free(comm);
+            return ncclSystemError;
+        }
+    }
     
     // Initialize handshake queue and thread
     pthread_mutex_init(&comm->queue_mutex, NULL);
@@ -3117,6 +3319,7 @@ static ncclResult_t mesh_listen(int dev, void *handle, void **listenComm) {
     // Fill handle with ALL our addresses
     memset(h, 0, sizeof(*h));
     h->magic = MESH_HANDLE_MAGIC;
+    h->version = MESH_HANDLE_VERSION;
     h->num_addrs = 0;
     h->psn = comm->psn;
     h->port_num = 1;
@@ -3124,6 +3327,16 @@ static ncclResult_t mesh_listen(int dev, void *handle, void **listenComm) {
     h->handshake_port = comm->handshake_port;
     // Store first NIC IP in handle - but connector will use selected_addr->ip for handshake
     h->handshake_ip = htonl(comm->qps[0].nic->ip_addr);
+    if (comm->hybrid_tcp_sock >= 0) {
+        h->flags |= MESH_HANDLE_FLAG_HYBRID_TCP;
+        h->hybrid_tcp_ip = htonl(comm->hybrid_tcp_ip);
+        h->hybrid_tcp_port = comm->hybrid_tcp_port;
+        char tcp_ip_str[INET_ADDRSTRLEN];
+        mesh_uint_to_ip(comm->hybrid_tcp_ip, tcp_ip_str, sizeof(tcp_ip_str));
+        MESH_LOG(NCCL_LOG_INFO,
+                 "MESH listen: hybrid TCP endpoint %s:%u",
+                 tcp_ip_str, comm->hybrid_tcp_port);
+    }
     
     // Get GID from first NIC for the primary GID field (TICKET-5: use cached GID)
     struct mesh_nic *primary_nic = comm->qps[0].nic;
@@ -3245,11 +3458,33 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
     }
 
     if (!nic || !selected_addr) {
+        int peer_has_hybrid =
+            handle->version == MESH_HANDLE_VERSION &&
+            (handle->flags & MESH_HANDLE_FLAG_HYBRID_TCP) &&
+            handle->hybrid_tcp_ip != 0 && handle->hybrid_tcp_port != 0;
+
+        if (g_mesh_state.hybrid_tcp_enabled && peer_has_hybrid) {
+            uint32_t tcp_peer_ip = ntohl(handle->hybrid_tcp_ip);
+            char tcp_ip_str[INET_ADDRSTRLEN];
+            mesh_uint_to_ip(tcp_peer_ip, tcp_ip_str, sizeof(tcp_ip_str));
+            MESH_LOG(NCCL_LOG_INFO,
+                     "MESH connect: no direct RDMA subnet; selecting hybrid "
+                     "management TCP peer=%s:%u",
+                     tcp_ip_str, handle->hybrid_tcp_port);
+            return mesh_tcp_connect_endpoint(
+                g_mesh_state.hybrid_tcp_ip, tcp_peer_ip,
+                handle->hybrid_tcp_port, "Hybrid TCP connect",
+                sendComm, sendDevComm);
+        }
+
         MESH_WARN("connect: No local NIC found on same subnet as any peer address");
         for (int i = 0; i < handle->num_addrs; i++) {
             char ip_str[INET_ADDRSTRLEN];
             mesh_uint_to_ip(ntohl(handle->addrs[i].ip), ip_str, sizeof(ip_str));
             MESH_WARN("  Peer address %d: %s", i, ip_str);
+        }
+        if (g_mesh_state.hybrid_tcp_enabled && !peer_has_hybrid) {
+            MESH_WARN("connect: peer did not advertise a compatible hybrid TCP endpoint");
         }
         return ncclSystemError;
     }
@@ -3407,65 +3642,102 @@ static ncclResult_t mesh_accept(void *listenComm, void **recvComm,
         MESH_WARN("accept: invalid listen object kind %d", listen_kind);
         return ncclInvalidArgument;
     }
-
-    // NCCL-001: Check for fatal async event before accept
     if (mesh_check_fatal_error()) {
-        MESH_WARN("accept: plugin in fatal error state — %s", g_mesh_state.fatal_error_msg);
+        MESH_WARN("accept: plugin in fatal error state — %s",
+                  g_mesh_state.fatal_error_msg);
         return ncclInternalError;
     }
 
-    struct mesh_listen_comm *lcomm = (struct mesh_listen_comm *)listenComm;
-    struct mesh_recv_comm *rcomm;
+    struct mesh_listen_comm *lcomm =
+        (struct mesh_listen_comm *)listenComm;
+    struct handshake_entry accepted_entry;
+    memset(&accepted_entry, 0, sizeof(accepted_entry));
 
-    // Allocate recv comm
-    rcomm = calloc(1, sizeof(*rcomm));
+    if (lcomm->hybrid_tcp_sock >= 0) {
+        struct timespec start;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        while (1) {
+            int have_rdma = 0;
+            pthread_mutex_lock(&lcomm->queue_mutex);
+            if (lcomm->queue_head != lcomm->queue_tail) {
+                struct handshake_entry *entry =
+                    &lcomm->handshake_queue[lcomm->queue_head];
+                accepted_entry = *entry;
+                memset(entry, 0, sizeof(*entry));
+                lcomm->queue_head =
+                    (lcomm->queue_head + 1) % HANDSHAKE_QUEUE_SIZE;
+                have_rdma = 1;
+            }
+            pthread_mutex_unlock(&lcomm->queue_mutex);
+            if (have_rdma) break;
+
+            struct sockaddr_in peer_addr;
+            socklen_t peer_len = sizeof(peer_addr);
+            int conn_sock = accept(lcomm->hybrid_tcp_sock,
+                                   (struct sockaddr *)&peer_addr, &peer_len);
+            if (conn_sock >= 0) {
+                return mesh_tcp_finish_accept(
+                    conn_sock, &peer_addr, "Hybrid TCP accept",
+                    recvComm, recvDevComm);
+            }
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                MESH_WARN("Hybrid TCP accept failed: %s", strerror(errno));
+                return ncclSystemError;
+            }
+
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            time_t elapsed = now.tv_sec - start.tv_sec;
+            if (elapsed >= g_mesh_state.accept_timeout_sec) {
+                MESH_WARN("accept: Timeout waiting for RDMA or hybrid TCP connection");
+                return ncclSystemError;
+            }
+            usleep(1000);
+        }
+    } else {
+        pthread_mutex_lock(&lcomm->queue_mutex);
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_sec += g_mesh_state.accept_timeout_sec;
+
+        while (lcomm->queue_head == lcomm->queue_tail) {
+            int rc = pthread_cond_timedwait(
+                &lcomm->queue_cond, &lcomm->queue_mutex, &timeout);
+            if (rc == ETIMEDOUT) {
+                pthread_mutex_unlock(&lcomm->queue_mutex);
+                MESH_WARN("accept: Timeout waiting for handshake");
+                return ncclSystemError;
+            }
+        }
+
+        struct handshake_entry *entry =
+            &lcomm->handshake_queue[lcomm->queue_head];
+        accepted_entry = *entry;
+        memset(entry, 0, sizeof(*entry));
+        lcomm->queue_head =
+            (lcomm->queue_head + 1) % HANDSHAKE_QUEUE_SIZE;
+        pthread_mutex_unlock(&lcomm->queue_mutex);
+    }
+
+    struct mesh_recv_comm *rcomm = calloc(1, sizeof(*rcomm));
     if (!rcomm) {
+        if (accepted_entry.local_qp) ibv_destroy_qp(accepted_entry.local_qp);
+        if (accepted_entry.local_cq) ibv_destroy_cq(accepted_entry.local_cq);
         return ncclSystemError;
     }
     mesh_object_init(&rcomm->object, MESH_OBJ_RECV_RDMA);
-    
-    // Wait for handshake from queue (filled by handshake thread)
-    pthread_mutex_lock(&lcomm->queue_mutex);
-
-    // NCCL-001: Wait with configurable timeout (NCCL_MESH_ACCEPT_TIMEOUT_SEC)
-    struct timespec timeout;
-    clock_gettime(CLOCK_REALTIME, &timeout);
-    timeout.tv_sec += g_mesh_state.accept_timeout_sec;
-    
-    while (lcomm->queue_head == lcomm->queue_tail) {
-        int rc = pthread_cond_timedwait(&lcomm->queue_cond, &lcomm->queue_mutex, &timeout);
-        if (rc == ETIMEDOUT) {
-            pthread_mutex_unlock(&lcomm->queue_mutex);
-            MESH_WARN("accept: Timeout waiting for handshake");
-            free(rcomm);
-            return ncclSystemError;
-        }
-    }
-    
-    // Get entry from queue
-    struct handshake_entry *entry = &lcomm->handshake_queue[lcomm->queue_head];
-    lcomm->queue_head = (lcomm->queue_head + 1) % HANDSHAKE_QUEUE_SIZE;
-    
-    // Copy data out
-    rcomm->qp = entry->local_qp;
-    rcomm->cq = entry->local_cq;
-    rcomm->nic = entry->nic;
-    entry->valid = 0;
-    
-    pthread_mutex_unlock(&lcomm->queue_mutex);
-    
-    
+    rcomm->qp = accepted_entry.local_qp;
+    rcomm->cq = accepted_entry.local_cq;
+    rcomm->nic = accepted_entry.nic;
     rcomm->connected = 1;
-    clock_gettime(CLOCK_MONOTONIC, &rcomm->conn_established_time);  // NCCL-001
-    // Extract peer IP from handshake info for error logging
-    rcomm->peer_ip = ntohl(entry->remote_info.ip);
+    rcomm->peer_ip = ntohl(accepted_entry.remote_info.ip);
+    clock_gettime(CLOCK_MONOTONIC, &rcomm->conn_established_time);
 
-    MESH_INFO("accept: Ready on %s (QP %d)", rcomm->nic->dev_name, rcomm->qp->qp_num);
-    
+    MESH_INFO("accept: Ready on %s (QP %d)",
+              rcomm->nic->dev_name, rcomm->qp->qp_num);
     *recvComm = rcomm;
     if (recvDevComm) *recvDevComm = NULL;
-    
-    
     return ncclSuccess;
 }
 
@@ -3654,6 +3926,9 @@ static ncclResult_t mesh_isend(void *sendComm, void *data, int size, int tag,
         return ncclSystemError;
     }
 
+    __atomic_fetch_add(&comm->send_ops, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&comm->bytes_sent, (uint64_t)size, __ATOMIC_RELAXED);
+
     // Per-NIC metrics: track send op and in-flight count
     if (comm->nic) {
         __atomic_fetch_add(&comm->nic->send_ops, 1, __ATOMIC_RELAXED);
@@ -3758,6 +4033,10 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
         free(req);
         return ncclSystemError;
     }
+
+    __atomic_fetch_add(&comm->recv_ops, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&comm->bytes_recv, (uint64_t)sizes[0],
+                       __ATOMIC_RELAXED);
 
     // Per-NIC metrics: track recv op and in-flight count
     if (comm->nic) {
@@ -4218,6 +4497,19 @@ static ncclResult_t mesh_closeSend(void *sendComm) {
         }
         comm->num_requests = 0;
 
+        char summary_ip[INET_ADDRSTRLEN];
+        mesh_uint_to_ip(comm->peer_ip, summary_ip, sizeof(summary_ip));
+        MESH_LOG(NCCL_LOG_INFO,
+                 "MESH connection-summary transport=rdma direction=send "
+                 "peer=%s ops=%lu bytes=%lu errors=%lu",
+                 summary_ip,
+                 (unsigned long)__atomic_load_n(&comm->send_ops,
+                                                 __ATOMIC_RELAXED),
+                 (unsigned long)__atomic_load_n(&comm->bytes_sent,
+                                                 __ATOMIC_RELAXED),
+                 (unsigned long)__atomic_load_n(&comm->error_count,
+                                                 __ATOMIC_RELAXED));
+
         // TICKET-6: Release pooled connection instead of destroying
         if (comm->pool_entry) {
             mesh_conn_pool_release(comm->pool_entry);
@@ -4294,6 +4586,19 @@ static ncclResult_t mesh_closeRecv(void *recvComm) {
         }
         comm->num_requests = 0;
 
+        char summary_ip[INET_ADDRSTRLEN];
+        mesh_uint_to_ip(comm->peer_ip, summary_ip, sizeof(summary_ip));
+        MESH_LOG(NCCL_LOG_INFO,
+                 "MESH connection-summary transport=rdma direction=recv "
+                 "peer=%s ops=%lu bytes=%lu errors=%lu",
+                 summary_ip,
+                 (unsigned long)__atomic_load_n(&comm->recv_ops,
+                                                 __ATOMIC_RELAXED),
+                 (unsigned long)__atomic_load_n(&comm->bytes_recv,
+                                                 __ATOMIC_RELAXED),
+                 (unsigned long)__atomic_load_n(&comm->error_count,
+                                                 __ATOMIC_RELAXED));
+
         /*
          * NCCL-001 Work Item 6: Graceful connection teardown
          * Transition QP to RESET state before destroying to drain pending operations.
@@ -4346,9 +4651,12 @@ static ncclResult_t mesh_closeListen(void *listenComm) {
             __atomic_store_n(&comm->thread_running, 0, __ATOMIC_RELEASE);
         }
         
-        // Close handshake socket
+        // Close handshake and optional hybrid data-listener sockets.
         if (comm->handshake_sock >= 0) {
             close(comm->handshake_sock);
+        }
+        if (comm->hybrid_tcp_sock >= 0) {
+            close(comm->hybrid_tcp_sock);
         }
         
         // Destroy mutex and condition

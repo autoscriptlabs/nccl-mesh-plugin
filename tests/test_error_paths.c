@@ -141,6 +141,7 @@ static void test_config_defaults(void) {
     state.accept_timeout_sec = 30;
     state.health_check_interval_ms = 1000;
     state.fatal_on_timeout = 1;
+    state.hybrid_tcp_enabled = 0;
 
     TEST_ASSERT(state.op_timeout_sec == 30,
                 "Default op_timeout_sec should be 30");
@@ -152,6 +153,8 @@ static void test_config_defaults(void) {
                 "Default health_check_interval_ms should be 1000");
     TEST_ASSERT(state.fatal_on_timeout == 1,
                 "Default fatal_on_timeout should be 1");
+    TEST_ASSERT(state.hybrid_tcp_enabled == 0,
+                "Default hybrid_tcp_enabled should be 0");
 }
 
 /*
