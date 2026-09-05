@@ -5,6 +5,14 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Status: Operational](https://img.shields.io/badge/status-operational-brightgreen.svg)](#project-status)
 
+> **GB10 patches on this branch** (`gb10-dual-link-ptrcuda`) — see upstream PR
+> [autoscriptlabs/nccl-mesh-plugin#59](https://github.com/autoscriptlabs/nccl-mesh-plugin/pull/59),
+> follow-up to [#58](https://github.com/autoscriptlabs/nccl-mesh-plugin/issues/58).
+> Env knobs: `NCCL_MESH_MIN_RNR_TIMER` (default 1), `NCCL_MESH_LINKS_PER_PEER`
+> (default 0 = use every link found), `NCCL_MESH_PTR_CUDA` and `NCCL_MESH_FLUSH`
+> (default 1 each). All default to today's behaviour on a single-cable-per-peer
+> fabric.
+
 ## Overview
 
 NCCL Mesh makes direct-attached RDMA topologies usable as a serious alternative

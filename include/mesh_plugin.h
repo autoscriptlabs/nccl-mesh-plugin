@@ -224,6 +224,17 @@ struct mesh_recv_comm {
     // Request tracking
     struct mesh_request *requests[MESH_MAX_QPS];
     int num_requests;
+
+    /*
+     * GPUDirect flush (patch 0006). Loopback QP used by mesh_iflush to force
+     * a NIC-written GPU buffer to be visible before NCCL reads it. Created
+     * lazily on the first flush that needs it, torn down in closeRecv.
+     */
+    struct ibv_qp *flush_qp;
+    struct ibv_cq *flush_cq;
+    struct ibv_mr *flush_mr;    // MR over flush_buf
+    int flush_buf;              // 4-byte landing pad for the RDMA_READ
+    int flush_failed;           // 1 once loopback setup failed (do not retry)
 };
 
 /*
@@ -236,6 +247,8 @@ struct mesh_mr_handle {
     size_t size;
     int is_tcp;                 // 1 if this is a TCP fallback registration
     int is_managed;             // 1 if pointer is CUDA unified/managed memory
+    int is_device;              // 1 if pointer is CUDA device memory (patch 0006)
+    int via_dmabuf;             // 1 if registered through ibv_reg_dmabuf_mr
 };
 
 /*
@@ -375,6 +388,7 @@ struct mesh_request {
     struct ibv_wc wc;
     void *comm;                 // Associated send/recv comm (for error propagation)
     int is_send;                // 1 if send request, 0 if recv
+    int is_flush;               // 1 if this is an iflush RDMA_READ (patch 0006)
     struct timespec start_time; // NCCL-001: Monotonic clock at request creation for timeout
 };
 
@@ -392,6 +406,12 @@ struct mesh_plugin_state {
     int fast_fail;              // NCCL_MESH_FAST_FAIL: reduce retries for faster failure detection
     int timeout_ms;             // NCCL_MESH_TIMEOUT_MS: connection timeout in ms (default: 5000)
     int retry_count;            // NCCL_MESH_RETRY_COUNT: retry attempts (default: 3)
+    int min_rnr_timer;          // NCCL_MESH_MIN_RNR_TIMER: RNR NAK timer code 0-31 (default: 1 = 0.01ms)
+    int links_per_peer;         // NCCL_MESH_LINKS_PER_PEER: parallel links used per peer (0 = every link found)
+    int distinct_guid;          // NCCL_MESH_DISTINCT_GUID: advertise a unique guid per port (default: 0)
+    int ptr_cuda;               // NCCL_MESH_PTR_CUDA: advertise NCCL_PTR_CUDA (default: 1)
+    int dmabuf_enable;          // NCCL_MESH_DMABUF: advertise NCCL_PTR_DMABUF (default: 0)
+    int flush_enable;           // NCCL_MESH_FLUSH: real RDMA_READ flush in iflush (default: 1)
     int disable_rdma;           // NCCL_MESH_DISABLE_RDMA: force TCP fallback
 
     // Connection pooling config (TICKET-6)
