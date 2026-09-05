@@ -2884,6 +2884,33 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
     if (g_mesh_state.min_rnr_timer < 0 || g_mesh_state.min_rnr_timer > 31)
         g_mesh_state.min_rnr_timer = 1;
 
+    /*
+     * NCCL_MESH_LINKS_PER_PEER: how many of the parallel links to a peer this
+     * plugin is allowed to spread connections over. 0 (default) means every
+     * link it finds; 1 reproduces the pre-patch behaviour exactly (always the
+     * first subnet match, NCCL's device index ignored).
+     *
+     * On a direct-attached mesh a "link" is one cable: one local NIC whose
+     * subnet matches one of the addresses the peer advertised in its handle.
+     * A three-node triangle wired with two cables per node pair has two such
+     * links per peer; a triangle wired with one cable per pair has one, and
+     * there this knob changes nothing.
+     */
+    env_val = getenv("NCCL_MESH_LINKS_PER_PEER");
+    g_mesh_state.links_per_peer = env_val ? atoi(env_val) : 0;
+    if (g_mesh_state.links_per_peer < 0) g_mesh_state.links_per_peer = 0;
+
+    /*
+     * NCCL_MESH_DISTINCT_GUID: report a unique guid per physical port instead
+     * of 0 for all of them. NCCL uses the guid to recognise several logical
+     * devices that are the same physical NIC; reporting 0 everywhere tells it
+     * the opposite of the truth in both directions. It has not been measured
+     * to matter on this fabric, so it stays off by default and is here to be
+     * A/B'd rather than assumed.
+     */
+    env_val = getenv("NCCL_MESH_DISTINCT_GUID");
+    g_mesh_state.distinct_guid = env_val ? atoi(env_val) : 0;
+
     // NCCL_MESH_DISABLE_RDMA: Force TCP fallback (default: 0)
     env_val = getenv("NCCL_MESH_DISABLE_RDMA");
     g_mesh_state.disable_rdma = env_val ? atoi(env_val) : 0;
@@ -2939,6 +2966,10 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
              g_mesh_state.gid_index, g_mesh_state.debug_level, g_mesh_state.fast_fail,
              g_mesh_state.timeout_ms, g_mesh_state.retry_count, g_mesh_state.disable_rdma,
              g_mesh_state.enable_conn_pool, g_mesh_state.enable_async_connect);
+    MESH_LOG(NCCL_LOG_INFO, "MESH Link selection: min_rnr_timer=%d links_per_peer=%d (0=all) "
+             "distinct_guid=%d",
+             g_mesh_state.min_rnr_timer, g_mesh_state.links_per_peer,
+             g_mesh_state.distinct_guid);
     MESH_LOG(NCCL_LOG_INFO, "MESH Error hardening: op_timeout=%ds connect_timeout=%ds "
              "accept_timeout=%ds health_check=%dms fatal_on_timeout=%d",
              g_mesh_state.op_timeout_sec, g_mesh_state.connect_timeout_sec,
@@ -3041,7 +3072,9 @@ static ncclResult_t mesh_getProperties(int dev, ncclNetProperties_v8_t *props) {
     /* TICKET-D: pciPath may be empty on Grace Blackwell (NVLink-C2C topology).
      * NCCL treats NULL/empty pciPath as "use any NIC" which is correct. */
     props->pciPath = nic->pci_path[0] ? nic->pci_path : NULL;
-    props->guid = 0;
+    /* A unique guid per physical port, when asked for (NCCL_MESH_DISTINCT_GUID).
+     * The port's fabric IP is unique within the node and stable across a boot. */
+    props->guid = g_mesh_state.distinct_guid ? (uint64_t)nic->ip_addr : 0;
     props->ptrSupport = NCCL_PTR_HOST;
     props->regIsGlobal = 0;
     // Use actual link speed if available, otherwise default to 100 Gbps
@@ -3186,7 +3219,8 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
         return mesh_tcp_connect_impl(dev, opaqueHandle, sendComm, sendDevComm);
     }
 
-    (void)dev;  // We pick the right NIC based on subnet match
+    /* dev is NOT discarded any more: it selects which of the parallel links to
+     * this peer this connection rides. See the candidate list below. */
 
     // NCCL-001: Check for fatal async event before connection attempt
     if (mesh_check_fatal_error()) {
@@ -3213,52 +3247,84 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
         return ncclInvalidArgument;
     }
     
-    MESH_INFO("connect: Peer advertised %d addresses", handle->num_addrs);
+    MESH_INFO("connect: Peer advertised %d addresses (NCCL dev=%d)",
+              handle->num_addrs, dev);
 
-    // Search through peer's addresses to find one we can reach
-    // Priority: Fast lane (100Gbps+) first, then management (10GbE) as fallback
+    /*
+     * Enumerate every parallel link to this peer, then let NCCL's device index
+     * choose among them.
+     *
+     * A candidate is a (local NIC, peer address) pair sharing a subnet, i.e.
+     * one cable. Pass 0 collects fast-lane cables only; pass 1 runs only if
+     * pass 0 found nothing and accepts any lane, so a 10GbE management link is
+     * never mixed into a fast-lane set (that was the point of the original
+     * two-pass search and it is preserved).
+     *
+     * Candidates are collected in the peer's advertised order, and within one
+     * peer address in local NIC order -- exactly the order the old first-match
+     * search walked -- so cands[0] is the NIC that search would have returned.
+     * With one link per peer, or NCCL_MESH_LINKS_PER_PEER=1, the selection is
+     * therefore bit-identical to the pre-patch plugin.
+     */
+    struct mesh_link_cand {
+        struct mesh_nic *nic;
+        struct mesh_addr_entry *addr;
+    } cands[MESH_MAX_NICS];
+    int ncand = 0;
 
-    // Pass 1: Try to find a fast lane connection
-    for (int i = 0; i < handle->num_addrs; i++) {
-        struct mesh_addr_entry *addr = &handle->addrs[i];
-        uint32_t peer_ip = ntohl(addr->ip);
+    for (int pass = 0; pass < 2 && ncand == 0; pass++) {
+        for (int i = 0; i < handle->num_addrs && ncand < MESH_MAX_NICS; i++) {
+            struct mesh_addr_entry *addr = &handle->addrs[i];
+            uint32_t cand_peer_ip = ntohl(addr->ip);
 
-        char ip_str[INET_ADDRSTRLEN];
-        mesh_uint_to_ip(peer_ip, ip_str, sizeof(ip_str));
-        MESH_DEBUG("connect: Checking peer address %d for fast lane: %s", i, ip_str);
+            for (int j = 0; j < g_mesh_state.num_nics && ncand < MESH_MAX_NICS; j++) {
+                struct mesh_nic *cand_nic = &g_mesh_state.nics[j];
+                int dup = 0;
 
-        // Find fast lane NIC on same subnet
-        nic = mesh_find_fast_nic_for_ip(peer_ip);
-        if (nic) {
-            selected_addr = addr;
-            MESH_INFO("connect: Found FAST LANE NIC %s (%d Mbps) for peer %s",
-                      nic->dev_name, nic->link_speed_mbps, ip_str);
-            break;
+                if (pass == 0 && cand_nic->lane != MESH_LANE_FAST) continue;
+                if ((cand_peer_ip & cand_nic->netmask) != cand_nic->subnet) continue;
+
+                for (int k = 0; k < ncand; k++) {
+                    if (cands[k].nic == cand_nic) { dup = 1; break; }
+                }
+                if (dup) continue;
+
+                cands[ncand].nic = cand_nic;
+                cands[ncand].addr = addr;
+                ncand++;
+            }
         }
     }
 
-    // Pass 2: If no fast lane, try any NIC (including management)
-    if (!nic) {
-        MESH_DEBUG("connect: No fast lane connection available, trying management network");
-        for (int i = 0; i < handle->num_addrs; i++) {
-            struct mesh_addr_entry *addr = &handle->addrs[i];
-            uint32_t peer_ip = ntohl(addr->ip);
+    if (ncand > 0) {
+        int usable = ncand;
+        int pick;
 
-            char ip_str[INET_ADDRSTRLEN];
-            mesh_uint_to_ip(peer_ip, ip_str, sizeof(ip_str));
-            MESH_DEBUG("connect: Checking peer address %d for any lane: %s", i, ip_str);
-
-            // Find any NIC on same subnet
-            nic = mesh_find_nic_for_ip(peer_ip);
-            if (nic) {
-                selected_addr = addr;
-                const char *lane_name = mesh_lane_name((enum mesh_nic_lane)nic->lane);
-                MESH_INFO("connect: Found %s NIC %s (%d Mbps) for peer %s",
-                          lane_name, nic->dev_name,
-                          nic->link_speed_mbps > 0 ? nic->link_speed_mbps : 0, ip_str);
-                break;
-            }
+        if (g_mesh_state.links_per_peer > 0 && g_mesh_state.links_per_peer < usable) {
+            usable = g_mesh_state.links_per_peer;
         }
+        /* dev is NCCL's netDev for this channel. Channels are handed out over
+         * the devices round-robin, so dev % usable spreads the channels evenly
+         * over the cables. A negative dev (never seen from NCCL) falls back to
+         * the first cable. */
+        pick = (dev >= 0) ? (dev % usable) : 0;
+
+        nic = cands[pick].nic;
+        selected_addr = cands[pick].addr;
+
+        for (int k = 0; k < ncand; k++) {
+            char cand_ip[INET_ADDRSTRLEN];
+            mesh_uint_to_ip(ntohl(cands[k].addr->ip), cand_ip, sizeof(cand_ip));
+            MESH_INFO("connect:   link %d/%d %s -> %s%s", k, ncand,
+                      cands[k].nic->dev_name, cand_ip,
+                      (k == pick) ? "   <== selected"
+                                  : (k >= usable ? "   (capped out)" : ""));
+        }
+        MESH_INFO("connect: dev=%d selects link %d of %d usable (%d found), "
+                  "%s NIC %s (%d Mbps)",
+                  dev, pick, usable, ncand,
+                  mesh_lane_name((enum mesh_nic_lane)nic->lane),
+                  nic->dev_name, nic->link_speed_mbps > 0 ? nic->link_speed_mbps : 0);
     }
 
     if (!nic || !selected_addr) {
@@ -4356,7 +4422,9 @@ static ncclResult_t mesh_getProperties_v9(int dev, ncclNetProperties_v9_t *props
     /* TICKET-D: pciPath may be empty on Grace Blackwell (NVLink-C2C topology).
      * NCCL treats NULL pciPath as "use any NIC" which is correct. */
     props->pciPath = g_v9_pcipath_storage[0] ? g_v9_pcipath_storage : NULL;
-    props->guid = 0;
+    /* A unique guid per physical port, when asked for (NCCL_MESH_DISTINCT_GUID).
+     * The port's fabric IP is unique within the node and stable across a boot. */
+    props->guid = g_mesh_state.distinct_guid ? (uint64_t)nic->ip_addr : 0;
     props->ptrSupport = NCCL_PTR_HOST;
     props->regIsGlobal = 0;
     props->forceFlush = 0;

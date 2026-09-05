@@ -393,6 +393,8 @@ struct mesh_plugin_state {
     int timeout_ms;             // NCCL_MESH_TIMEOUT_MS: connection timeout in ms (default: 5000)
     int retry_count;            // NCCL_MESH_RETRY_COUNT: retry attempts (default: 3)
     int min_rnr_timer;          // NCCL_MESH_MIN_RNR_TIMER: RNR NAK timer code 0-31 (default: 1 = 0.01ms)
+    int links_per_peer;         // NCCL_MESH_LINKS_PER_PEER: parallel links used per peer (0 = every link found)
+    int distinct_guid;          // NCCL_MESH_DISTINCT_GUID: advertise a unique guid per port (default: 0)
     int disable_rdma;           // NCCL_MESH_DISABLE_RDMA: force TCP fallback
 
     // Connection pooling config (TICKET-6)
