@@ -28,6 +28,12 @@
 
 #include <infiniband/verbs.h>
 
+/* RTLD_DEFAULT is a GNU extension; glibc defines it only under __USE_GNU.
+ * It is reached here through the include chain, but do not depend on that. */
+#ifndef RTLD_DEFAULT
+#define RTLD_DEFAULT ((void *)0)
+#endif
+
 #include "nccl/net.h"
 #include "mesh_plugin.h"
 #include "mesh_routing.h"
@@ -66,37 +72,88 @@ typedef int (*cudaPointerGetAttributes_fn)(struct cuda_pointer_attributes *, con
 static cudaPointerGetAttributes_fn g_cudaPointerGetAttributes = NULL;
 static int g_cuda_checked = 0;
 
+/*
+ * DMA-BUF export + registration, resolved at runtime (patch 0006).
+ *
+ * ibv_reg_dmabuf_mr appeared in rdma-core 33 / IBVERBS_1.12. Resolving it with
+ * dlsym instead of linking against it keeps the plugin loadable on an older
+ * libibverbs, and doubles as the "is DMA-BUF available at all" test that gates
+ * whether NCCL_PTR_DMABUF is advertised.
+ *
+ * cuMemGetHandleForAddressRange is the CUDA driver call that turns a device
+ * allocation into a DMA-BUF fd. NCCL calls it itself before regMrDmaBuf; we
+ * only need it for the fallback path where NCCL handed us a plain device
+ * pointer through regMr and ibv_reg_mr refused it.
+ */
+#define MESH_CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD 0x1
+typedef struct ibv_mr *(*ibv_reg_dmabuf_mr_fn)(struct ibv_pd *, uint64_t, size_t,
+                                               uint64_t, int, int);
+typedef int (*cuMemGetHandleForAddressRange_fn)(void *, unsigned long long, size_t,
+                                                unsigned int, unsigned long long);
+static ibv_reg_dmabuf_mr_fn g_ibv_reg_dmabuf_mr = NULL;
+static cuMemGetHandleForAddressRange_fn g_cuMemGetHandleForAddressRange = NULL;
+
 static void mesh_init_cuda_check(void) {
     if (g_cuda_checked) return;
     g_cuda_checked = 1;
-    void *handle = dlopen("libcudart.so", RTLD_LAZY | RTLD_NOLOAD);
-    if (!handle) {
-        /* Try versioned name */
-        handle = dlopen("libcudart.so.12", RTLD_LAZY | RTLD_NOLOAD);
+
+    /*
+     * The CUDA runtime soname tracks the CUDA major version, so try the ones
+     * this stack can plausibly be running under, then fall back to whatever is
+     * already in the global namespace. RTLD_NOLOAD throughout: the plugin must
+     * never be the thing that pulls CUDA in.
+     */
+    static const char *rt_names[] = {
+        "libcudart.so", "libcudart.so.13", "libcudart.so.12", "libcudart.so.11.0", NULL
+    };
+    void *handle = NULL;
+    for (int i = 0; rt_names[i] && !handle; i++) {
+        handle = dlopen(rt_names[i], RTLD_LAZY | RTLD_NOLOAD);
     }
     if (handle) {
         g_cudaPointerGetAttributes =
             (cudaPointerGetAttributes_fn)dlsym(handle, "cudaPointerGetAttributes");
-        if (g_cudaPointerGetAttributes) {
-            MESH_INFO("CUDA runtime found - unified memory detection enabled");
-        }
         /* Don't dlclose - we need the symbol to remain valid */
     }
+    if (!g_cudaPointerGetAttributes) {
+        g_cudaPointerGetAttributes =
+            (cudaPointerGetAttributes_fn)dlsym(RTLD_DEFAULT, "cudaPointerGetAttributes");
+    }
+    if (g_cudaPointerGetAttributes) {
+        MESH_INFO("CUDA runtime found - device/unified memory detection enabled");
+    } else {
+        MESH_INFO("CUDA runtime not found - falling back to NCCL's own pointer type");
+    }
+
+    g_ibv_reg_dmabuf_mr = (ibv_reg_dmabuf_mr_fn)dlsym(RTLD_DEFAULT, "ibv_reg_dmabuf_mr");
+
+    void *cu = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_NOLOAD);
+    if (!cu) cu = dlopen("libcuda.so", RTLD_LAZY | RTLD_NOLOAD);
+    if (cu) {
+        g_cuMemGetHandleForAddressRange = (cuMemGetHandleForAddressRange_fn)
+            dlsym(cu, "cuMemGetHandleForAddressRange");
+    }
+    MESH_INFO("DMA-BUF: ibv_reg_dmabuf_mr=%s cuMemGetHandleForAddressRange=%s",
+              g_ibv_reg_dmabuf_mr ? "yes" : "no",
+              g_cuMemGetHandleForAddressRange ? "yes" : "no");
 }
 
 /*
  * Check if a pointer is CUDA managed (unified) memory.
  * Returns 1 if managed, 0 otherwise or if CUDA is not available.
  */
-static int mesh_is_managed_memory(const void *ptr) {
-    if (!g_cudaPointerGetAttributes) return 0;
+static int mesh_cuda_ptr_type(const void *ptr) {
+    if (!g_cudaPointerGetAttributes) return CUDA_MEMORY_TYPE_UNREGISTERED;
 
     struct cuda_pointer_attributes attrs;
     memset(&attrs, 0, sizeof(attrs));
     int err = g_cudaPointerGetAttributes(&attrs, ptr);
-    if (err != 0) return 0;
-    return (attrs.type == CUDA_MEMORY_TYPE_MANAGED);
+    if (err != 0) return CUDA_MEMORY_TYPE_UNREGISTERED;
+    return attrs.type;
 }
+
+/* Defined next to getProperties; used by mesh_init to log the advertised set. */
+static int mesh_ptr_support(void);
 
 // Global state
 struct mesh_plugin_state g_mesh_state = {0};
@@ -2911,6 +2968,44 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
     env_val = getenv("NCCL_MESH_DISTINCT_GUID");
     g_mesh_state.distinct_guid = env_val ? atoi(env_val) : 0;
 
+    /*
+     * NCCL_MESH_PTR_CUDA: advertise NCCL_PTR_CUDA in getProperties (default 1).
+     *
+     * Set to 0 to go back to the host-only plugin exactly: NCCL then stages
+     * every transfer through a cudaHostAlloc bounce buffer, which is what this
+     * plugin did before patch 0006.
+     */
+    env_val = getenv("NCCL_MESH_PTR_CUDA");
+    g_mesh_state.ptr_cuda = env_val ? atoi(env_val) : 1;
+
+    /*
+     * NCCL_MESH_DMABUF: also advertise NCCL_PTR_DMABUF (default 0).
+     *
+     * regMrDmaBuf is implemented (it really calls ibv_reg_dmabuf_mr), but on a
+     * unified-memory part the plain ibv_reg_mr path is the one that matches how
+     * the memory is actually backed, and a DMA-BUF registration that succeeds
+     * while describing the wrong pages would corrupt data silently rather than
+     * fail. So it is opt-in and A/B'd, not assumed. Only honoured when
+     * ibv_reg_dmabuf_mr actually resolves.
+     */
+    env_val = getenv("NCCL_MESH_DMABUF");
+    g_mesh_state.dmabuf_enable = env_val ? atoi(env_val) : 0;
+
+    /*
+     * NCCL_MESH_FLUSH: perform a real RDMA_READ flush in iflush (default 1).
+     *
+     * When NCCL hands the NIC a GPU buffer directly, the completion of an
+     * incoming write does not by itself guarantee the GPU will observe the
+     * data; NCCL's net API delegates that guarantee to iflush, and NCCL's own
+     * IB plugin implements it as a 4-byte RDMA_READ of the just-written buffer
+     * over a loopback QP. This plugin now does the same. Setting 0 restores the
+     * old no-op, which is only safe if the platform is coherent enough not to
+     * need it -- that is a measurement, not an assumption, so the default is
+     * the correct-by-construction one.
+     */
+    env_val = getenv("NCCL_MESH_FLUSH");
+    g_mesh_state.flush_enable = env_val ? atoi(env_val) : 1;
+
     // NCCL_MESH_DISABLE_RDMA: Force TCP fallback (default: 0)
     env_val = getenv("NCCL_MESH_DISABLE_RDMA");
     g_mesh_state.disable_rdma = env_val ? atoi(env_val) : 0;
@@ -2970,6 +3065,9 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
              "distinct_guid=%d",
              g_mesh_state.min_rnr_timer, g_mesh_state.links_per_peer,
              g_mesh_state.distinct_guid);
+    MESH_LOG(NCCL_LOG_INFO, "MESH Pointer support: ptr_cuda=%d dmabuf=%d flush=%d -> ptrSupport=0x%x",
+             g_mesh_state.ptr_cuda, g_mesh_state.dmabuf_enable, g_mesh_state.flush_enable,
+             mesh_ptr_support());
     MESH_LOG(NCCL_LOG_INFO, "MESH Error hardening: op_timeout=%ds connect_timeout=%ds "
              "accept_timeout=%ds health_check=%dms fatal_on_timeout=%d",
              g_mesh_state.op_timeout_sec, g_mesh_state.connect_timeout_sec,
@@ -3055,6 +3153,26 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
     return ncclSuccess;
 }
 
+/*
+ * Which pointer kinds this plugin accepts in regMr.
+ *
+ * Advertising NCCL_PTR_CUDA is what makes NCCL hand us GPU buffers instead of
+ * staging every transfer through a host bounce buffer; regMr has been able to
+ * register them all along. NCCL_PTR_DMABUF is only added when regMrDmaBuf can
+ * genuinely do something (ibv_reg_dmabuf_mr resolved) and the operator asked
+ * for it.
+ */
+static int mesh_ptr_support(void) {
+    int support = NCCL_PTR_HOST;
+    if (g_mesh_state.ptr_cuda) {
+        support |= NCCL_PTR_CUDA;
+        if (g_mesh_state.dmabuf_enable && g_ibv_reg_dmabuf_mr) {
+            support |= NCCL_PTR_DMABUF;
+        }
+    }
+    return support;
+}
+
 static ncclResult_t mesh_devices(int *ndev) {
     *ndev = g_mesh_state.num_nics;
     return ncclSuccess;
@@ -3075,7 +3193,7 @@ static ncclResult_t mesh_getProperties(int dev, ncclNetProperties_v8_t *props) {
     /* A unique guid per physical port, when asked for (NCCL_MESH_DISTINCT_GUID).
      * The port's fabric IP is unique within the node and stable across a boot. */
     props->guid = g_mesh_state.distinct_guid ? (uint64_t)nic->ip_addr : 0;
-    props->ptrSupport = NCCL_PTR_HOST;
+    props->ptrSupport = mesh_ptr_support();
     props->regIsGlobal = 0;
     // Use actual link speed if available, otherwise default to 100 Gbps
     props->speed = (nic->link_speed_mbps > 0) ? nic->link_speed_mbps : 100000;
@@ -3545,12 +3663,20 @@ static ncclResult_t mesh_accept(void *listenComm, void **recvComm,
     return ncclSuccess;
 }
 
-static ncclResult_t mesh_regMr(void *comm, void *data, size_t size, int type, void **mhandle) {
-    // Dispatch to TCP if in fallback mode (TICKET-4)
-    if (g_mesh_state.tcp_fallback_active) {
-        return mesh_tcp_regMr(comm, data, size, type, mhandle);
-    }
-
+/*
+ * Common registration path for regMr and regMrDmaBuf.
+ *
+ * fd >= 0 means NCCL exported a DMA-BUF for this buffer and wants it registered
+ * that way; offset is the offset of the buffer inside that DMA-BUF. fd < 0 is
+ * the ordinary path.
+ *
+ * comm is cast to mesh_send_comm only to read ->nic, which is the first member
+ * of both mesh_send_comm and mesh_recv_comm -- NCCL calls regMr with either.
+ * That aliasing is pre-existing; it is spelled out here rather than fixed
+ * because changing it is not what this patch is for.
+ */
+static ncclResult_t mesh_reg_mr_common(void *comm, void *data, size_t size, int type,
+                                       uint64_t offset, int fd, void **mhandle) {
     struct mesh_send_comm *scomm = (struct mesh_send_comm *)comm;
     struct mesh_mr_handle *mrh;
     int access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
@@ -3568,33 +3694,71 @@ static ncclResult_t mesh_regMr(void *comm, void *data, size_t size, int type, vo
     }
 
     /*
-     * TICKET-C: Unified memory handling for Grace Blackwell
+     * TICKET-C / patch 0006: unified AND device memory on Grace Blackwell.
      *
-     * On Grace Blackwell, CUDA unified (managed) memory is backed by a single
-     * allocation accessible from both CPU and GPU via NVLink-C2C. When NCCL
-     * passes a unified memory pointer, ibv_reg_mr can register it directly
-     * since the CPU can access the pages. The RDMA NIC will DMA from the
-     * CPU-visible mapping.
+     * This part has no separate framebuffer: GPU and CPU address the same
+     * LPDDR5X through the same page tables (Addressing Mode: ATS, C2C on), so
+     * a cudaMalloc pointer is an ordinary virtual address whose pages the CPU
+     * can also reach. ibv_reg_mr can therefore register it directly, which is
+     * why regMr was already written to try -- the only thing that used to stop
+     * NCCL from ever handing us one was ptrSupport saying HOST.
      *
-     * If ibv_reg_mr fails on managed memory (e.g., pages not yet faulted in),
-     * we fall through to a host-pinned fallback: the data must be copied to
-     * a host buffer before RDMA, which NCCL handles via its proxy thread.
-     * We log a warning so the operator knows performance may be degraded.
+     * Order of attempts:
+     *   1. a DMA-BUF fd from NCCL (regMrDmaBuf), when it offered one;
+     *   2. plain ibv_reg_mr -- the expected path here;
+     *   3. exporting a DMA-BUF ourselves, for a device pointer ibv_reg_mr
+     *      refused. The fd is closed immediately: the kernel takes its own
+     *      reference on the dma_buf, exactly as NCCL's IB plugin assumes.
      */
-    int managed = mesh_is_managed_memory(data);
-    if (managed) {
-        MESH_DEBUG("regMr: detected CUDA managed/unified memory at %p", data);
+    int ptr_type = mesh_cuda_ptr_type(data);
+    long page_size = sysconf(_SC_PAGESIZE);
+    uint64_t base;
+    size_t aligned_len;
+
+    if (page_size <= 0) page_size = 4096;
+    base = (uint64_t)(uintptr_t)data & ~((uint64_t)page_size - 1);
+    aligned_len = (size_t)(((uint64_t)(uintptr_t)data + size - base
+                            + (uint64_t)page_size - 1) & ~((uint64_t)page_size - 1));
+
+    mrh->is_managed = (ptr_type == CUDA_MEMORY_TYPE_MANAGED);
+    /* If the CUDA runtime is not reachable we still know what NCCL told us. */
+    mrh->is_device = (ptr_type == CUDA_MEMORY_TYPE_DEVICE) ||
+                     (ptr_type == CUDA_MEMORY_TYPE_UNREGISTERED && type == NCCL_PTR_CUDA);
+
+    if (fd >= 0 && g_ibv_reg_dmabuf_mr) {
+        mrh->mr = g_ibv_reg_dmabuf_mr(scomm->nic->pd, offset, aligned_len, base,
+                                      fd, access_flags);
+        if (mrh->mr) {
+            mrh->via_dmabuf = 1;
+        } else {
+            MESH_WARN("regMr: ibv_reg_dmabuf_mr failed (%s) - retrying with ibv_reg_mr",
+                      strerror(errno));
+        }
     }
 
-    mrh->mr = ibv_reg_mr(scomm->nic->pd, data, size, access_flags);
     if (!mrh->mr) {
-        if (managed) {
-            MESH_WARN("regMr: ibv_reg_mr failed on unified memory (%s) - "
-                      "NCCL will use host staging buffers (slower path)",
-                      strerror(errno));
-        } else {
-            MESH_WARN("Failed to register MR: %s", strerror(errno));
+        mrh->mr = ibv_reg_mr(scomm->nic->pd, data, size, access_flags);
+    }
+
+    if (!mrh->mr && (mrh->is_device || mrh->is_managed) &&
+        g_ibv_reg_dmabuf_mr && g_cuMemGetHandleForAddressRange) {
+        int self_fd = -1;
+        if (g_cuMemGetHandleForAddressRange(&self_fd, (unsigned long long)base,
+                                            aligned_len,
+                                            MESH_CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
+                                            0ULL) == 0 && self_fd >= 0) {
+            mrh->mr = g_ibv_reg_dmabuf_mr(scomm->nic->pd, 0ULL, aligned_len, base,
+                                          self_fd, access_flags);
+            if (mrh->mr) mrh->via_dmabuf = 1;
+            close(self_fd);
         }
+    }
+
+    if (!mrh->mr) {
+        MESH_WARN("regMr: failed to register %zu bytes at %p (type=%d device=%d "
+                  "managed=%d): %s. Set NCCL_MESH_PTR_CUDA=0 to go back to the "
+                  "host-staged path.",
+                  size, data, type, mrh->is_device, mrh->is_managed, strerror(errno));
         free(mrh);
         return ncclSystemError;
     }
@@ -3602,18 +3766,29 @@ static ncclResult_t mesh_regMr(void *comm, void *data, size_t size, int type, vo
     mrh->nic = scomm->nic;
     mrh->addr = data;
     mrh->size = size;
-    mrh->is_managed = managed;
+
+    MESH_DEBUG("regMr: registered %zu B at %p (device=%d managed=%d dmabuf=%d)",
+               size, data, mrh->is_device, mrh->is_managed, mrh->via_dmabuf);
 
     *mhandle = mrh;
     return ncclSuccess;
 }
 
+static ncclResult_t mesh_regMr(void *comm, void *data, size_t size, int type, void **mhandle) {
+    // Dispatch to TCP if in fallback mode (TICKET-4)
+    if (g_mesh_state.tcp_fallback_active) {
+        return mesh_tcp_regMr(comm, data, size, type, mhandle);
+    }
+    return mesh_reg_mr_common(comm, data, size, type, 0ULL, -1, mhandle);
+}
+
 static ncclResult_t mesh_regMrDmaBuf(void *comm, void *data, size_t size, int type,
                                     uint64_t offset, int fd, void **mhandle) {
-    // DMA-BUF not implemented yet - these params unused
-    (void)offset;
-    (void)fd;
-    return mesh_regMr(comm, data, size, type, mhandle);
+    // Dispatch to TCP if in fallback mode (TICKET-4)
+    if (g_mesh_state.tcp_fallback_active) {
+        return mesh_tcp_regMr(comm, data, size, type, mhandle);
+    }
+    return mesh_reg_mr_common(comm, data, size, type, offset, fd, mhandle);
 }
 
 static ncclResult_t mesh_deregMr(void *comm, void *mhandle) {
@@ -3819,15 +3994,193 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
     return ncclSuccess;
 }
 
+/*
+ * Bring a QP up against itself, for the iflush loopback.
+ *
+ * mesh_connect_qp cannot be reused here: it takes the destination QP number
+ * through struct mesh_handle, whose qp_num field is 16 bits wide (it is a wire
+ * structure and is not being changed by this patch), while a real QP number is
+ * 24 bits. The loopback transitions are short enough to spell out.
+ */
+static int mesh_qp_loopback_connect(struct ibv_qp *qp, struct mesh_nic *nic) {
+    struct ibv_qp_attr attr;
+    union ibv_gid gid;
+
+    if (mesh_get_gid(nic, &gid) != 0) {
+        MESH_WARN("iflush: cannot read GID on %s", nic->dev_name);
+        return -1;
+    }
+
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_RTR;
+    attr.path_mtu = nic->active_mtu;
+    attr.dest_qp_num = qp->qp_num;          /* itself */
+    attr.rq_psn = 0;
+    attr.max_dest_rd_atomic = 1;
+    attr.min_rnr_timer = g_mesh_state.min_rnr_timer;
+    attr.ah_attr.is_global = 1;
+    attr.ah_attr.grh.dgid = gid;            /* our own GID */
+    attr.ah_attr.grh.sgid_index = nic->gid_index;
+    attr.ah_attr.grh.hop_limit = 64;
+    attr.ah_attr.dlid = 0;
+    attr.ah_attr.sl = 0;
+    attr.ah_attr.src_path_bits = 0;
+    attr.ah_attr.port_num = nic->port_num;
+
+    if (ibv_modify_qp(qp, &attr,
+            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+            IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER)) {
+        MESH_WARN("iflush: loopback QP RTR failed on %s: %s",
+                  nic->dev_name, strerror(errno));
+        return -1;
+    }
+
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_RTS;
+    attr.timeout = 14;
+    attr.retry_cnt = 7;
+    attr.rnr_retry = 7;
+    attr.sq_psn = 0;
+    attr.max_rd_atomic = 1;
+
+    if (ibv_modify_qp(qp, &attr,
+            IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+            IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC)) {
+        MESH_WARN("iflush: loopback QP RTS failed on %s: %s",
+                  nic->dev_name, strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Lazily build the loopback QP + landing pad this recv comm flushes through. */
+static int mesh_flush_setup(struct mesh_recv_comm *comm) {
+    if (comm->flush_qp) return 0;
+    if (comm->flush_failed) return -1;
+
+    if (!comm->nic || !comm->nic->pd) {
+        comm->flush_failed = 1;
+        return -1;
+    }
+
+    comm->flush_mr = ibv_reg_mr(comm->nic->pd, &comm->flush_buf,
+                                sizeof(comm->flush_buf), IBV_ACCESS_LOCAL_WRITE);
+    if (!comm->flush_mr) {
+        MESH_WARN("iflush: cannot register flush landing pad on %s: %s",
+                  comm->nic->dev_name, strerror(errno));
+        comm->flush_failed = 1;
+        return -1;
+    }
+
+    if (mesh_create_qp(comm->nic, &comm->flush_qp, &comm->flush_cq) != 0) {
+        ibv_dereg_mr(comm->flush_mr);
+        comm->flush_mr = NULL;
+        comm->flush_failed = 1;
+        return -1;
+    }
+
+    if (mesh_qp_loopback_connect(comm->flush_qp, comm->nic) != 0) {
+        ibv_destroy_qp(comm->flush_qp);
+        ibv_destroy_cq(comm->flush_cq);
+        ibv_dereg_mr(comm->flush_mr);
+        comm->flush_qp = NULL;
+        comm->flush_cq = NULL;
+        comm->flush_mr = NULL;
+        comm->flush_failed = 1;
+        return -1;
+    }
+
+    MESH_INFO("iflush: loopback QP %d ready on %s", comm->flush_qp->qp_num,
+              comm->nic->dev_name);
+    return 0;
+}
+
+/*
+ * iflush - make an incoming write visible to the GPU before NCCL reads it.
+ *
+ * With ptrSupport = NCCL_PTR_HOST this was correctly a no-op: NCCL only ever
+ * handed the NIC host buffers. Once NCCL_PTR_CUDA is advertised the guarantee
+ * NCCL's net API asks of iflush becomes real, and the standard way to give it
+ * is the one NCCL's own IB plugin uses -- a 4-byte RDMA_READ of the buffer that
+ * was just written, over a QP looped back to this same NIC. The read cannot be
+ * reordered ahead of the writes it follows, so its completion proves they have
+ * landed.
+ *
+ * Only the last non-empty buffer of the batch is read: the NIC retires the
+ * writes of one irecv in order.
+ *
+ * Host buffers still short-circuit, so with NCCL_MESH_PTR_CUDA=0 this function
+ * behaves exactly as it did before.
+ */
 static ncclResult_t mesh_iflush(void *recvComm, int n, void **data, int *sizes,
                                void **mhandles, void **request) {
-    // No flush needed for verbs - silence unused parameter warnings
-    (void)recvComm;
-    (void)n;
-    (void)data;
-    (void)sizes;
-    (void)mhandles;
+    struct mesh_recv_comm *comm = (struct mesh_recv_comm *)recvComm;
+    struct mesh_mr_handle *mrh;
+    struct mesh_request *req;
+    struct ibv_send_wr wr, *bad_wr = NULL;
+    struct ibv_sge sge;
+    int last = -1;
+
     *request = NULL;
+
+    if (g_mesh_state.tcp_fallback_active) return ncclSuccess;
+    if (!g_mesh_state.flush_enable) return ncclSuccess;
+    if (!comm || !data || !sizes || !mhandles) return ncclSuccess;
+
+    for (int i = 0; i < n; i++) {
+        if (sizes[i]) last = i;
+    }
+    if (last < 0) return ncclSuccess;
+
+    mrh = (struct mesh_mr_handle *)mhandles[last];
+    if (!mrh || !mrh->mr) return ncclSuccess;
+
+    /* Host memory is coherent by construction - nothing to force. */
+    if (!mrh->is_device && !mrh->is_managed) return ncclSuccess;
+
+    if (mesh_flush_setup(comm) != 0) {
+        MESH_WARN("iflush: no loopback QP - refusing to skip the flush silently. "
+                  "Set NCCL_MESH_FLUSH=0 to accept an unflushed GPU path, or "
+                  "NCCL_MESH_PTR_CUDA=0 to go back to host staging.");
+        return ncclSystemError;
+    }
+
+    req = calloc(1, sizeof(*req));
+    if (!req) return ncclSystemError;
+    __atomic_fetch_add(&g_mesh_state.requests_allocated, 1, __ATOMIC_RELAXED);
+
+    req->used = 1;
+    req->size = 0;
+    req->cq = comm->flush_cq;
+    req->done = 0;
+    req->comm = NULL;        /* not tracked on the comm: it is not a data op */
+    req->is_send = 1;
+    req->is_flush = 1;
+    clock_gettime(CLOCK_MONOTONIC, &req->start_time);
+
+    sge.addr = (uintptr_t)&comm->flush_buf;
+    sge.length = sizeof(comm->flush_buf);
+    sge.lkey = comm->flush_mr->lkey;
+
+    memset(&wr, 0, sizeof(wr));
+    wr.wr_id = (uintptr_t)req;
+    wr.next = NULL;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_READ;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = (uintptr_t)data[last];
+    wr.wr.rdma.rkey = mrh->mr->rkey;
+
+    if (ibv_post_send(comm->flush_qp, &wr, &bad_wr)) {
+        MESH_WARN("iflush: ibv_post_send failed: %s", strerror(errno));
+        __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
+        free(req);
+        return ncclSystemError;
+    }
+
+    *request = req;
     return ncclSuccess;
 }
 
@@ -4034,7 +4387,8 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
             long elapsed_sec = now.tv_sec - req->start_time.tv_sec;
 
             if (elapsed_sec >= g_mesh_state.op_timeout_sec) {
-                const char *op_str = req->is_send ? "SEND" : "RECV";
+                const char *op_str = req->is_flush ? "FLUSH"
+                                                   : (req->is_send ? "SEND" : "RECV");
                 uint32_t peer_ip = 0;
                 uint32_t qp_num = 0;
                 uint64_t conn_age = 0;
@@ -4093,7 +4447,8 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
          * WR_FLUSH_ERR (QP in error state).
          */
         if (wc.status != IBV_WC_SUCCESS) {
-            const char *op_str = (completed_req && completed_req->is_send) ? "SEND" : "RECV";
+            const char *op_str = (completed_req && completed_req->is_flush) ? "FLUSH"
+                                 : ((completed_req && completed_req->is_send) ? "SEND" : "RECV");
             uint32_t peer_ip = 0;
             uint32_t qp_num = wc.qp_num;
             uint64_t conn_age = 0;
@@ -4274,6 +4629,22 @@ static ncclResult_t mesh_closeRecv(void *recvComm) {
         }
         comm->num_requests = 0;
 
+        /* patch 0006: tear down the iflush loopback, if one was built */
+        if (comm->flush_qp) {
+            if (ibv_destroy_qp(comm->flush_qp) != 0) {
+                MESH_WARN("closeRecv: ibv_destroy_qp(flush) failed: %s", strerror(errno));
+            }
+            comm->flush_qp = NULL;
+        }
+        if (comm->flush_cq) {
+            ibv_destroy_cq(comm->flush_cq);
+            comm->flush_cq = NULL;
+        }
+        if (comm->flush_mr) {
+            ibv_dereg_mr(comm->flush_mr);
+            comm->flush_mr = NULL;
+        }
+
         /*
          * NCCL-001 Work Item 6: Graceful connection teardown
          * Transition QP to RESET state before destroying to drain pending operations.
@@ -4425,7 +4796,7 @@ static ncclResult_t mesh_getProperties_v9(int dev, ncclNetProperties_v9_t *props
     /* A unique guid per physical port, when asked for (NCCL_MESH_DISTINCT_GUID).
      * The port's fabric IP is unique within the node and stable across a boot. */
     props->guid = g_mesh_state.distinct_guid ? (uint64_t)nic->ip_addr : 0;
-    props->ptrSupport = NCCL_PTR_HOST;
+    props->ptrSupport = mesh_ptr_support();
     props->regIsGlobal = 0;
     props->forceFlush = 0;
     /* Use actual link speed if available */
