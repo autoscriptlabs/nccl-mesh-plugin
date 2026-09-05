@@ -392,6 +392,7 @@ struct mesh_plugin_state {
     int fast_fail;              // NCCL_MESH_FAST_FAIL: reduce retries for faster failure detection
     int timeout_ms;             // NCCL_MESH_TIMEOUT_MS: connection timeout in ms (default: 5000)
     int retry_count;            // NCCL_MESH_RETRY_COUNT: retry attempts (default: 3)
+    int min_rnr_timer;          // NCCL_MESH_MIN_RNR_TIMER: RNR NAK timer code 0-31 (default: 1 = 0.01ms)
     int disable_rdma;           // NCCL_MESH_DISABLE_RDMA: force TCP fallback
 
     // Connection pooling config (TICKET-6)

@@ -1062,7 +1062,7 @@ int mesh_connect_qp(struct ibv_qp *qp, struct mesh_nic *nic, struct mesh_handle 
         qp_attr.dest_qp_num = remote->qp_num;
         qp_attr.rq_psn = remote->psn;
         qp_attr.max_dest_rd_atomic = 1;
-        qp_attr.min_rnr_timer = 12;  // ~0.01ms min RNR NAK timer
+        qp_attr.min_rnr_timer = g_mesh_state.min_rnr_timer;  // IBTA code; 1 = 0.01ms
         qp_attr.ah_attr.is_global = 1;
         qp_attr.ah_attr.grh.dgid = remote->gid;
         qp_attr.ah_attr.grh.sgid_index = nic->gid_index;
@@ -2859,6 +2859,30 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
     env_val = getenv("NCCL_MESH_RETRY_COUNT");
     g_mesh_state.retry_count = env_val ? atoi(env_val) : 3;
     if (g_mesh_state.retry_count < 1) g_mesh_state.retry_count = 1;  // Minimum 1
+
+    /*
+     * NCCL_MESH_MIN_RNR_TIMER: responder RNR NAK timer, IBTA code 0-31.
+     *
+     * This plugin moves data with two-sided SEND/RECV, so flow control is the
+     * RNR NAK: whenever a send lands on a QP whose receive queue is momentarily
+     * empty, the responder NAKs and the requester stalls for min_rnr_timer
+     * before retrying. NCCL opens one connection per channel and its proxy
+     * thread services them round-robin, so the sender routinely arrives before
+     * the receiver has re-armed -- an RNR is normal operation here, not an
+     * error, and rnr_retry is set to 7 (infinite) below on purpose.
+     *
+     * The timer must therefore be short enough that a normal RNR costs about
+     * as much as one proxy lap. Code 1 is 0.01 ms; code 12 -- the value a
+     * switched-fabric plugin would use, where RNR only happens on real
+     * congestion -- is 0.64 ms, which quantises every such stall up to two
+     * orders of magnitude above its true length.
+     *
+     * IBTA encoding: 0 = 655.36 ms, 1 = 0.01 ms, 2 = 0.02, ..., 12 = 0.64 ms.
+     */
+    env_val = getenv("NCCL_MESH_MIN_RNR_TIMER");
+    g_mesh_state.min_rnr_timer = env_val ? atoi(env_val) : 1;
+    if (g_mesh_state.min_rnr_timer < 0 || g_mesh_state.min_rnr_timer > 31)
+        g_mesh_state.min_rnr_timer = 1;
 
     // NCCL_MESH_DISABLE_RDMA: Force TCP fallback (default: 0)
     env_val = getenv("NCCL_MESH_DISABLE_RDMA");
